@@ -1,0 +1,225 @@
+# tinygit
+
+**用纯 JavaScript 从零实现的 Git 子集。** 零依赖，不调用 `git` 命令，直接按 Git 的磁盘格式读写仓库。
+
+它创建出来的仓库，**一个真正的 Git 客户端可以直接打开** —— 对象哈希、tree 排序、索引校验和、commit 格式全部按规范实现，并由一个独立重写的验证器交叉校验。
+
+## 它解决什么问题
+
+大多数人对 Git 的理解停在「背命令」。真要说清「提交到底是什么」「为什么同样的文件不同历史会有不同哈希」「`.git/index` 里存了什么」，往往说不明白。
+
+这个项目把这些概念**变成可读的代码**：
+
+| 你可能想知道 | 对应文件 |
+| --- | --- |
+| 提交是怎么存的？ | [src/commit.js](src/commit.js) |
+| 为什么内容相同哈希就相同？ | [src/objects.js](src/objects.js) |
+| 目录结构怎么表示？排序为什么特殊？ | [src/tree.js](src/tree.js) |
+| 暂存区到底是什么？ | [src/index-file.js](src/index-file.js) |
+| `git diff` 的算法原理 | [src/diff.js](src/diff.js) |
+| 分支只是个文件吗？ | [src/refs.js](src/refs.js) |
+
+## 快速开始
+
+```bash
+node bin/tinygit.js init 我的仓库
+cd 我的仓库
+node ../bin/tinygit.js status
+node ../bin/tinygit.js add .
+node ../bin/tinygit.js commit -m "第一次提交"
+node ../bin/tinygit.js log
+```
+
+或者直接看完整演示（会在临时目录走完全流程并自动清理）：
+
+```bash
+node scripts/demo.mjs
+```
+
+## 支持的命令
+
+| 命令 | 说明 |
+| --- | --- |
+| `init [目录]` | 创建 `.git` 目录结构 |
+| `status` | 三态比较：HEAD / 索引 / 工作区 |
+| `add <路径...>` | 写入 blob 并更新索引，遵守 `.gitignore` |
+| `commit -m <消息>` | 构建 tree、写 commit、推进分支 |
+| `log [--oneline] [-n N]` | 沿 parent 链回溯历史 |
+| `diff [--staged] [<a> <b>]` | Myers 算法，输出 unified diff |
+| `branch [-d <名>] [<名>]` | 列出 / 创建 / 删除分支 |
+| `rm <路径...>` | 从索引移除（保留工作区文件）|
+| `merge <分支>` | 快进或三方归并，冲突时写标记文件 |
+| `pack-info` | 统计 `.git/objects/pack` 里的打包对象 |
+| `checkout <分支>` | 切换分支并检出文件 |
+| `ls-tree <tree>` | 列出树内容（输出格式与 git 一致） |
+| `cat-file <对象>` | 输出对象原始内容 |
+| `hash-object <文件>` | 计算并写入 blob |
+
+## 实现要点
+
+### 内容寻址
+
+对象文件名 = `sha1("<type> <size>\0" + content)`。所以：
+
+- 相同内容永远得到相同哈希，天然去重
+- 改一个字，从该文件到根 tree 再到 commit，整条哈希链全部改变
+- 校验和就是文件名本身，损坏能被发现
+
+```js
+hashObject("blob", "")   // e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
+hashObject("tree", "")   // 4b825dc642cb6eb9a060e54bf8d69288fbee4904
+```
+
+### tree 排序的特殊规则
+
+Git 比较 tree 条目时，把目录当作名字后接了 `/`。所以目录 `foo` 要排在文件 `foo.txt` **之后**（`'/'` 是 0x2f，`'.'` 是 0x2e）。
+
+排序错了哈希就不对，真 Git 会认为仓库损坏。见 [src/tree.js](src/tree.js) 的 `sortKey`。
+
+### 索引是二进制格式
+
+`.git/index` 不是文本。签名 `DIRC`，每条目 62 字节固定头 + 路径 + 填充到 8 字节边界，末尾 20 字节是全文 SHA-1。字节布局错一位，真 Git 直接拒绝读取。
+
+### diff 用 Myers 算法
+
+不用 LCS 的 O(NM)，而是 O((N+M)·D) 的最短编辑脚本搜索。见 [src/diff.js](src/diff.js)。
+
+### packfile：能读真 Git 的打包仓库
+
+真 Git clone 下来的仓库，对象几乎全在 `.git/objects/pack/*.pack` 里，
+而且绝大多数是 **delta 压缩**——只存「相对另一个对象的差异」。
+
+这意味着要处理四层叠加的复杂度：
+
+1. **对象边界**：zlib 流没有长度前缀，且 Node 的 `inflateSync` 不返回消耗字节数。
+   解法：zlib 流自带 adler32，截断必然失败，所以「能成功解压的最短前缀」就是流长度，对它二分。
+2. **两种变长整数**：`OFS_DELTA` 的偏移编码有 `+1` 修正，`delta` 头部的大小编码没有。
+3. **delta 指令流**：复制指令的偏移/长度是按需字段，且长度为 0 表示 65536。
+4. **delta 链**：base 本身可能是 delta，递归解析到完整对象。
+
+验证方式是用本机一个真实 Git 仓库的 pack（7.8 MB，**3,513 个对象**）跑：
+
+```
+声明对象数   : 3513
+解析出对象   : 3513
+偏移→sha 一致: 3513/3513  ✅
+类型分布     : {commit:1, tree:1294, blob:2218}
+```
+
+第二行是决定性证据：**只要 delta 链、对象头、zlib 边界任意一处出错，重新计算的 sha 都不可能和 idx 里记录的吻合**。
+
+细节与踩坑记录见 [docs/packfile-and-merge.md](docs/packfile-and-merge.md)。
+
+### 三方合并
+
+先求 merge base（最近公共祖先），再做 diff3 三路归并。
+
+- `src/merge-base.js`：在提交 DAG 上求最近公共祖先
+- `src/merge-file.js`：三路归并，`mergeSegments` 产出统一分段模型
+- `src/commands/merge.js`：快进 / 已最新 / 真合并 / 冲突 四种结果
+
+冲突时不自动提交，按 Git 格式写标记文件：
+
+```
+<<<<<<< main
+OURS
+=======
+THEIRS
+>>>>>>> feature
+```
+
+这一层踩到过一个真 bug：merge base 的「最近」判据写反，
+导致分支点不是根提交时退化成根提交，进而**产生假冲突**（两边改不同文件却报冲突）。
+详见 [docs/packfile-and-merge.md](docs/packfile-and-merge.md) 第二节。
+## 验证方式
+
+### 单元与集成测试
+
+```bash
+node --test
+```
+
+**128 项测试**，覆盖对象哈希常量、tree 排序、索引字节布局、diff 最短性、
+pack 变长整数、delta 应用、pack 写入读取闭环、真实 pack 解析、三方归并、merge base。
+
+### 独立审计器（`scripts/audit.mjs`）
+
+故意**不复用任何 `src/` 代码**，从头实现 Git 的读取规则，
+构成真正的交叉验证。如果审计器调用被测代码，同一处 bug 会让两边一起错、一起「通过」。
+
+`bash`
+node scripts/audit.mjs <仓库路径> --verbose
+`
+
+覆盖 112~129 项检查，包括对象内容寻址一致性、tree 条目 mode 合法性、
+tree 排序、提交图可达性、索引校验和与排序、索引与工作区一致性、孤儿对象检测。
+
+**审计器本身经过反面测试**：人为篡改对象内容 / 索引校验和 / 制造孤儿对象 / 
+写坏分支指针，四种损坏全部被检出 —— 确认它不会永远返回「通过」。
+
+### 独立验证器
+
+```bash
+node scripts/verify.mjs <仓库路径>
+```
+
+这个脚本**不复用 `src/` 的任何代码**，从零重新实现了一遍 Git 的格式规则，再用它校验 tinygit 生成的仓库。如果两边都用同一份有 bug 的实现，会一起错、一起「通过」；独立重写才能构成真正的交叉验证。
+
+校验内容：
+
+- 每个松散对象的文件路径 == 内容重算哈希
+- 对象头部声明的 size == 实际字节数
+- commit 的 tree 存在且确实是 tree 类型
+- author/committer 行的时区格式是 `±HHMM`
+- tree 条目按 Git 规则排序
+- tree 里引用的子对象都存在
+- 索引的 SHA-1 校验和正确
+- 索引条目指向的对象都存在
+- 空 blob / 空 tree 哈希等于公开常量
+
+## 已知边界
+
+这是**教学性质与工具性质并重**的实现，不是 Git 的完整替代。明确不支持：
+
+- **写 delta**：能读 delta 压缩的 pack，但自己写 pack 时只写完整对象
+- **rename 检测**：合并时不识别文件改名，会当成删除 + 新增
+- **rebase / cherry-pick / stash / tag / remote**
+- **thin pack**（`REF_DELTA` 的 base 在 pack 之外）与多 pack 索引
+- **`.gitignore` 的取反规则**（`!` 前缀）和嵌套 ignore 文件
+- **索引 v4** 和扩展段（`TREE`、`REUC` 等）
+- **Windows 上的可执行位**：NTFS 没有 POSIX 执行权限，`chmod` 后 `stat().mode` 不变，相关测试在该平台跳过
+
+## 目录结构
+
+```
+bin/tinygit.js        命令行入口
+src/
+  objects.js          对象编解码与内容寻址存储
+  tree.js             tree 序列化、排序、扁平化
+  index-file.js       索引二进制格式
+  commit.js           commit 序列化与解析
+  refs.js             HEAD / 分支引用
+  diff.js             Myers diff 与 unified 输出
+  repo.js             仓库初始化与定位
+  worktree.js         工作区扫描
+  ignore.js           .gitignore 匹配
+  args.js             参数解析
+  merge-base.js       最近公共祖先（提交 DAG）
+  merge-file.js       三路归并（mergeSegments 统一模型）
+  pack/
+    reader.js         pack 解析、delta 链还原、zlib 边界定位
+    writer.js         pack + idx 构建
+    idx.js            .idx v2 索引（fanout 表、二分查找）
+    delta.js          delta 应用算法
+    varint.js         两种变长整数编码
+    index.js          pack 子系统统一入口
+  commands/           各子命令实现
+scripts/
+  demo.mjs            端到端演示
+  verify.mjs          独立格式验证器
+test/                 128 项测试
+```
+
+## License
+
+MIT
