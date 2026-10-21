@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [18, 20, 22]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: 运行测试
+        run: node --test
+
+  format-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: 用 tinygit 建一个仓库
+        run: |
+          cd ${{ runner.temp }}
+          node "$GITHUB_WORKSPACE/bin/tinygit.js" init demo-repo
+          cd demo-repo
+          echo '# demo' > README.md
+          mkdir -p src && echo 'export const x = 1;' > src/a.js
+          node "$GITHUB_WORKSPACE/bin/tinygit.js" add .
+          node "$GITHUB_WORKSPACE/bin/tinygit.js" commit -m 'ci commit'
+          echo 'export const y = 2;' >> src/a.js
+          node "$GITHUB_WORKSPACE/bin/tinygit.js" add .
+          node "$GITHUB_WORKSPACE/bin/tinygit.js" commit -m 'second commit'
+      - name: 独立审计器交叉验证
+        run: |
+          cd ${{ runner.temp }}
+          node "$GITHUB_WORKSPACE/scripts/audit.mjs" demo-repo --verbose
+          echo '独立审计器通过（不复用 src/ 代码，构成真正的交叉验证）'
+
+      - name: 独立验证器校验格式
+        run: node scripts/verify.mjs "${{ runner.temp }}/demo-repo"
+      - name: 用真正的 git 打开它（最关键的一条）
+        run: |
+          cd ${{ runner.temp }}/demo-repo
+          git status
+          git log --oneline
+          test "$(git log --oneline | wc -l)" -eq 2
+          test "$(git rev-parse HEAD)" != ""
+          echo '真 git 成功读取了 tinygit 创建的仓库'
+
+      - name: 造一个有合并历史的仓库，供真 git 校验
+        run: |
+          cd ${{ runner.temp }}
+          node "$GITHUB_WORKSPACE/bin/tinygit.js" init merge-demo
+          cd merge-demo
+          git config user.email ci@example.com
+          git config user.name CI
+          printf 'a\nb\nc\n' > f.txt
+          node "$GITHUB_WORKSPACE/bin/tinygit.js" add .
+          node "$GITHUB_WORKSPACE/bin/tinygit.js" commit -m base
+          node "$GITHUB_WORKSPACE/bin/tinygit.js" branch feature
+          printf 'A\nb\nc\n' > f.txt
+          node "$GITHUB_WORKSPACE/bin/tinygit.js" add .
+          node "$GITHUB_WORKSPACE/bin/tinygit.js" commit -m main-change
+          node "$GITHUB_WORKSPACE/bin/tinygit.js" checkout feature
+          printf 'a\nb\nC\n' > f.txt
+          node "$GITHUB_WORKSPACE/bin/tinygit.js" add .
+          node "$GITHUB_WORKSPACE/bin/tinygit.js" commit -m feature-change
+          node "$GITHUB_WORKSPACE/bin/tinygit.js" checkout main
+          node "$GITHUB_WORKSPACE/bin/tinygit.js" merge feature
+          echo '--- 真 git 校验合并结果 ---'
+          git log --oneline --graph
+          git fsck --strict
+          git status --porcelain
+          test "$(git rev-list --count HEAD)" -eq 4
+          test "$(git rev-list --parents -n 1 HEAD | wc -w)" -eq 3
+          echo '真 git 确认这是合法的双亲合并提交'
+          cat f.txt
+
+  demo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: 跑端到端演示
+        run: node scripts/demo.mjs
