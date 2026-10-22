@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [18, 20, 22]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: 运行测试
+        run: node --test
+
+  format-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: 用 tinygit 建一个仓库
+        run: |
+          cd ${{ runner.temp }}
+          node "$GITHUB_WORKSPACE/bin/tinygit.js" init demo-repo
+          cd demo-repo
+          echo '# demo' > README.md
+          mkdir -p src && echo 'export const x = 1;' > src/a.js
+          node "$GITHUB_WORKSPACE/bin/tinygit.js" add .
+          node "$GITHUB_WORKSPACE/bin/tinygit.js" commit -m 'ci commit'
+          echo 'export const y = 2;' >> src/a.js
+          node "$GITHUB_WORKSPACE/bin/tinygit.js" add .
+          node "$GITHUB_WORKSPACE/bin/tinygit.js" commit -m 'second commit'
+      - name: 独立验证器校验格式
+        run: node scripts/verify.mjs "${{ runner.temp }}/demo-repo"
+      - name: 用真正的 git 打开它（最关键的一条）
+        run: |
+          cd ${{ runner.temp }}/demo-repo
+          git status
+          git log --oneline
+          test "$(git log --oneline | wc -l)" -eq 2
+          test "$(git rev-parse HEAD)" != ""
+          echo '真 git 成功读取了 tinygit 创建的仓库'
+
+  demo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: 跑端到端演示
+        run: node scripts/demo.mjs
