@@ -51,6 +51,35 @@ jobs:
           test "$(git rev-parse HEAD)" != ""
           echo '真 git 成功读取了 tinygit 创建的仓库'
 
+      - name: 造一个有合并历史的仓库，供真 git 校验
+        run: |
+          cd ${{ runner.temp }}
+          node "$GITHUB_WORKSPACE/bin/tinygit.js" init merge-demo
+          cd merge-demo
+          git config user.email ci@example.com
+          git config user.name CI
+          printf 'a\nb\nc\n' > f.txt
+          node "$GITHUB_WORKSPACE/bin/tinygit.js" add .
+          node "$GITHUB_WORKSPACE/bin/tinygit.js" commit -m base
+          node "$GITHUB_WORKSPACE/bin/tinygit.js" branch feature
+          printf 'A\nb\nc\n' > f.txt
+          node "$GITHUB_WORKSPACE/bin/tinygit.js" add .
+          node "$GITHUB_WORKSPACE/bin/tinygit.js" commit -m main-change
+          node "$GITHUB_WORKSPACE/bin/tinygit.js" checkout feature
+          printf 'a\nb\nC\n' > f.txt
+          node "$GITHUB_WORKSPACE/bin/tinygit.js" add .
+          node "$GITHUB_WORKSPACE/bin/tinygit.js" commit -m feature-change
+          node "$GITHUB_WORKSPACE/bin/tinygit.js" checkout main
+          node "$GITHUB_WORKSPACE/bin/tinygit.js" merge feature
+          echo '--- 真 git 校验合并结果 ---'
+          git log --oneline --graph
+          git fsck --strict
+          git status --porcelain
+          test "$(git rev-list --count HEAD)" -eq 4
+          test "$(git rev-list --parents -n 1 HEAD | wc -w)" -eq 3
+          echo '真 git 确认这是合法的双亲合并提交'
+          cat f.txt
+
   demo:
     runs-on: ubuntu-latest
     steps:

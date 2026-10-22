@@ -47,6 +47,8 @@ node scripts/demo.mjs
 | `log [--oneline] [-n N]` | 沿 parent 链回溯历史 |
 | `diff [--staged] [<a> <b>]` | Myers 算法，输出 unified diff |
 | `branch [-d <名>] [<名>]` | 列出 / 创建 / 删除分支 |
+| `merge <分支>` | 快进或三方归并，冲突时写标记文件 |
+| `pack-info` | 统计 `.git/objects/pack` 里的打包对象 |
 | `checkout <分支>` | 切换分支并检出文件 |
 | `ls-tree <tree>` | 列出树内容（输出格式与 git 一致） |
 | `cat-file <对象>` | 输出对象原始内容 |
@@ -81,6 +83,53 @@ Git 比较 tree 条目时，把目录当作名字后接了 `/`。所以目录 `f
 
 不用 LCS 的 O(NM)，而是 O((N+M)·D) 的最短编辑脚本搜索。见 [src/diff.js](src/diff.js)。
 
+### packfile：能读真 Git 的打包仓库
+
+真 Git clone 下来的仓库，对象几乎全在 `.git/objects/pack/*.pack` 里，
+而且绝大多数是 **delta 压缩**——只存「相对另一个对象的差异」。
+
+这意味着要处理四层叠加的复杂度：
+
+1. **对象边界**：zlib 流没有长度前缀，且 Node 的 `inflateSync` 不返回消耗字节数。
+   解法：zlib 流自带 adler32，截断必然失败，所以「能成功解压的最短前缀」就是流长度，对它二分。
+2. **两种变长整数**：`OFS_DELTA` 的偏移编码有 `+1` 修正，`delta` 头部的大小编码没有。
+3. **delta 指令流**：复制指令的偏移/长度是按需字段，且长度为 0 表示 65536。
+4. **delta 链**：base 本身可能是 delta，递归解析到完整对象。
+
+验证方式是用本机一个真实 Git 仓库的 pack（7.8 MB，**3,513 个对象**）跑：
+
+```
+声明对象数   : 3513
+解析出对象   : 3513
+偏移→sha 一致: 3513/3513  ✅
+类型分布     : {commit:1, tree:1294, blob:2218}
+```
+
+第二行是决定性证据：**只要 delta 链、对象头、zlib 边界任意一处出错，重新计算的 sha 都不可能和 idx 里记录的吻合**。
+
+细节与踩坑记录见 [docs/packfile-and-merge.md](docs/packfile-and-merge.md)。
+
+### 三方合并
+
+先求 merge base（最近公共祖先），再做 diff3 三路归并。
+
+- `src/merge-base.js`：在提交 DAG 上求最近公共祖先
+- `src/merge-file.js`：三路归并，`mergeSegments` 产出统一分段模型
+- `src/commands/merge.js`：快进 / 已最新 / 真合并 / 冲突 四种结果
+
+冲突时不自动提交，按 Git 格式写标记文件：
+
+```
+<<<<<<< main
+OURS
+=======
+THEIRS
+>>>>>>> feature
+```
+
+这一层踩到过一个真 bug：merge base 的「最近」判据写反，
+导致分支点不是根提交时退化成根提交，进而**产生假冲突**（两边改不同文件却报冲突）。
+详见 [docs/packfile-and-merge.md](docs/packfile-and-merge.md) 第二节。
 ## 验证方式
 
 ### 单元与集成测试
@@ -89,7 +138,8 @@ Git 比较 tree 条目时，把目录当作名字后接了 `/`。所以目录 `f
 node --test
 ```
 
-42 项测试，覆盖对象哈希常量、tree 排序、索引字节布局、diff 正确性，以及完整的 init→add→commit→log 流程。
+**110 项测试**，覆盖对象哈希常量、tree 排序、索引字节布局、diff 最短性、
+pack 变长整数、delta 应用、pack 写入读取闭环、真实 pack 解析、三方归并、merge base。
 
 ### 独立验证器
 
@@ -115,9 +165,10 @@ node scripts/verify.mjs <仓库路径>
 
 这是**教学性质与工具性质并重**的实现，不是 Git 的完整替代。明确不支持：
 
-- **packfile**：只读写松散对象。真 Git clone 下来的仓库几乎都是打包的，读不了
-- **合并**：没有 `merge`，也没有三方合并和冲突标记
+- **写 delta**：能读 delta 压缩的 pack，但自己写 pack 时只写完整对象
+- **rename 检测**：合并时不识别文件改名，会当成删除 + 新增
 - **rebase / cherry-pick / stash / tag / remote**
+- **thin pack**（`REF_DELTA` 的 base 在 pack 之外）与多 pack 索引
 - **`.gitignore` 的取反规则**（`!` 前缀）和嵌套 ignore 文件
 - **索引 v4** 和扩展段（`TREE`、`REUC` 等）
 - **Windows 上的可执行位**：NTFS 没有 POSIX 执行权限，`chmod` 后 `stat().mode` 不变，相关测试在该平台跳过
@@ -137,11 +188,20 @@ src/
   worktree.js         工作区扫描
   ignore.js           .gitignore 匹配
   args.js             参数解析
+  merge-base.js       最近公共祖先（提交 DAG）
+  merge-file.js       三路归并（mergeSegments 统一模型）
+  pack/
+    reader.js         pack 解析、delta 链还原、zlib 边界定位
+    writer.js         pack + idx 构建
+    idx.js            .idx v2 索引（fanout 表、二分查找）
+    delta.js          delta 应用算法
+    varint.js         两种变长整数编码
+    index.js          pack 子系统统一入口
   commands/           各子命令实现
 scripts/
   demo.mjs            端到端演示
   verify.mjs          独立格式验证器
-test/                 42 项测试
+test/                 110 项测试
 ```
 
 ## License

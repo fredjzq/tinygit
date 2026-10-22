@@ -32,6 +32,10 @@ const USAGE = [
   "分支:",
   "  branch [-d <名>] [<名>]     列出/创建/删除分支",
   "  checkout <分支>             切换分支",
+  "  merge <分支>                合并分支（快进/三方归并）",
+  "",
+  "packfile:",
+  "  pack-info                   显示打包对象统计",
   "",
   "退出码: 0 成功 · 1 用法/前置条件错误 · 2 内部异常",
 ].join("\n");
@@ -147,6 +151,39 @@ async function main(argv) {
       const { switchBranch } = await import("../src/commands/branch.js");
       const r = await switchBranch(gitDir, rootDir, args[0]);
       log.success("切换到分支 " + args[0] + (r.created ? "（新建）" : ""));
+      return 0;
+    }
+    case "merge": {
+      if (!args[0]) throw new Error("merge: 需要分支名");
+      const { merge } = await import("../src/commands/merge.js");
+      const r = await merge(gitDir, rootDir, args[0], {
+        message: flags.m ?? flags.message ?? null,
+        noCommit: flags["no-commit"] === true,
+      });
+      if (r.result === "up-to-date") {
+        console.log("已经是最新，无需合并（" + r.branch + " 已包含在当前分支中）");
+      } else if (r.result === "fast-forward") {
+        log.success("快进到 " + r.branch + " " + r.oid.slice(0, 7));
+      } else if (r.result === "conflict") {
+        log.error("合并产生冲突，需手工解决：");
+        for (const c of r.conflicts) console.log("  ✗ " + c.path + (c.binary ? "（二进制）" : "  " + c.regions + " 处冲突"));
+        console.log("\n解决后运行: tinygit add . && tinygit commit -m \"合并完成\"");
+        return 1;
+      } else if (r.result === "merged-not-committed") {
+        log.success("合并完成（未提交）");
+      } else {
+        log.success("合并提交 " + r.oid.slice(0, 7) + "（合并基 " + (r.baseOid ?? "").slice(0, 7) + "）");
+      }
+      return 0;
+    }
+    case "pack-info": {
+      const { createPackRepository } = await import("../src/pack/index.js");
+      const repo = createPackRepository(gitDir);
+      const stats = await repo.stats();
+      console.log("pack 文件: " + stats.packCount);
+      console.log("对象总数: " + stats.objectCount);
+      console.log("类型分布: " + JSON.stringify(stats.byType));
+      console.log("总字节  : " + stats.totalBytes);
       return 0;
     }
     default:

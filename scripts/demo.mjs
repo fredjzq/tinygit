@@ -79,13 +79,31 @@ async function main() {
   console.log("  该提交的 tree: " + treeOid);
   console.log(await tinygit(["ls-tree", treeOid]));
 
-  step(11, "独立验证器：从零重写 Git 格式规则来校验这个仓库");
+  step(11, "三方合并：造两个分支，修改同一文件的不同位置");
+  console.log(await tinygit(["checkout", "feature"]));
+  await writeFile(path.join(demo, "src", "math.js"),
+    "export function add(a, b) {\n  return a + b;\n}\n\nexport function mul(a, b) {\n  return a * b;\n}\n\nexport const VERSION = '1.1';\n");
+  console.log(await tinygit(["diff"]));
+  await tinygit(["add", "."]);
+  console.log(await tinygit(["commit", "-m", "feature: 增加 VERSION 常量"]));
+
+  console.log(await tinygit(["checkout", "main"]));
+  await writeFile(path.join(demo, "README.md"), "# 演示仓库\n\n由 tinygit 创建。\n\n新增一行说明。\n");
+  await tinygit(["add", "."]);
+  console.log(await tinygit(["commit", "-m", "main: 补充 README"]));
+
+  console.log("\n合并 feature 到 main：");
+  console.log(await tinygit(["merge", "feature"]));
+  console.log("\n合并后的历史（应看到 merge commit 两个 parent）：");
+  console.log(await tinygit(["log", "--oneline"]));
+
+  step(12, "独立验证器：从零重写 Git 格式规则来校验这个仓库");
   const { stdout: verifyOut } = await exec(process.execPath, [path.join(root, "scripts", "verify.mjs"), demo], {
     timeout: 60000, maxBuffer: 1e7,
   });
   console.log(verifyOut.trim());
 
-  step(12, "清理");
+  step(13, "清理");
   await rm(demo, { recursive: true, force: true });
   console.log("  已删除临时演示仓库");
   console.log("\n演示完成。\n");
