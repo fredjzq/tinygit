@@ -23,6 +23,8 @@ import { commit } from "../src/commands/commit.js";
 import { status } from "../src/commands/status.js";
 import { log } from "../src/commands/log.js";
 import { readHeadRef } from "../src/refs.js";
+import { createBranch, switchBranch } from "../src/commands/branch.js";
+import { merge } from "../src/commands/merge.js";
 import { readCommit } from "../src/commit.js";
 import { flattenTree } from "../src/tree.js";
 import { readObject } from "../src/objects.js";
@@ -159,6 +161,81 @@ test("log walks the parent chain newest first", async () => {
   });
 });
 
+test("log traverses ALL parents, not just the first", async () => {
+  await withRepo(async ({ dir, gitDir }) => {
+    await writeFile(path.join(dir, "f.txt"), "a\nb\nc\n");
+    await add(gitDir, dir, ["."]);
+    const c0 = await commit(gitDir, { message: "base" });
+
+    await createBranch(gitDir, "feature");
+    await writeFile(path.join(dir, "f.txt"), "a\nM\nc\n");
+    await add(gitDir, dir, ["."]);
+    const cm = await commit(gitDir, { message: "main-change" });
+
+    await switchBranch(gitDir, dir, "feature");
+    await writeFile(path.join(dir, "f.txt"), "a\nF\nc\n");
+    await add(gitDir, dir, ["."]);
+    const cfeat = await commit(gitDir, { message: "feature-change" });
+    await switchBranch(gitDir, dir, "main");
+
+    await merge(gitDir, dir, "feature");
+    await writeFile(path.join(dir, "f.txt"), "a\nOK\nc\n");
+    await add(gitDir, dir, ["."]);
+    const cres = await commit(gitDir, { message: "resolved" });
+
+    const commits = await log(gitDir, { limit: 20 });
+
+    // 两个分支的提交都必须出现。
+    // 早期实现只跟 parents[0]，feature 一侧的提交会整体消失。
+    const oids = commits.map((c) => c.oid);
+    assert.ok(oids.includes(c0.oid), "base must appear");
+    assert.ok(oids.includes(cm.oid), "main-side commit must appear");
+    assert.ok(oids.includes(cfeat.oid), "feature-side commit must appear");
+    assert.ok(oids.includes(cres.oid), "merge commit must appear");
+    assert.equal(commits.length, 4);
+  });
+});
+
+test("log orders commits so parents never precede their children", async () => {
+  await withRepo(async ({ dir, gitDir }) => {
+    await writeFile(path.join(dir, "f.txt"), "1\n");
+    await add(gitDir, dir, ["."]);
+    await commit(gitDir, { message: "one" });
+    for (const n of [2, 3, 4]) {
+      await writeFile(path.join(dir, "f.txt"), "v" + n + "\n");
+      await add(gitDir, dir, ["."]);
+      await commit(gitDir, { message: "commit " + n });
+    }
+
+    const commits = await log(gitDir, { limit: 10 });
+    const position = new Map(commits.map((c, i) => [c.oid, i]));
+
+    // 对任意提交，其所有父提交都必须排在它后面（索引更大）
+    for (const c of commits) {
+      for (const p of c.parents) {
+        if (!position.has(p)) continue;
+        assert.ok(
+          position.get(p) > position.get(c.oid),
+          "parent " + p.slice(0, 7) + " must come after child " + c.oid.slice(0, 7)
+        );
+      }
+    }
+    assert.equal(commits[0].message.trim(), "commit 4", "newest first");
+  });
+});
+
+test("log respects the limit on a merged history", async () => {
+  await withRepo(async ({ dir, gitDir }) => {
+    for (const n of [1, 2, 3, 4, 5]) {
+      await writeFile(path.join(dir, "f.txt"), "v" + n + "\n");
+      await add(gitDir, dir, ["."]);
+      await commit(gitDir, { message: "c" + n });
+    }
+    const commits = await log(gitDir, { limit: 2 });
+    assert.equal(commits.length, 2);
+  });
+});
+
 test("gitignore excludes matching files", async () => {
   await withRepo(async ({ dir, gitDir }) => {
     await writeFile(path.join(dir, ".gitignore"), "*.log\nnode_modules/\n");
@@ -194,6 +271,30 @@ test("executable bit is preserved in tree mode", { skip: isPosix ? false : "NTFS
     const files = await flattenTree(gitDir, c.tree);
     assert.equal(parseInt(files.get("run.sh").mode, 8), 0o100755);
   });
+});
+
+test("status does not write objects (must be read-only)", async () => {
+  const dir = await mkdtemp(path.join(TMP_ROOT, "tinygit-status-"));
+  try {
+    const gitDir = await initRepo(dir);
+    await writeFile(path.join(dir, "tracked.txt"), "tracked\n");
+    await add(gitDir, dir, ["."]);
+    await commit(gitDir, { message: "init" });
+
+    // 一个未跟踪文件：真 git 的 status 绝不会把它写进对象库。
+    // 早期版本用 writeObject 算哈希，导致每跑一次 status 就往 .git 塞 blob。
+    await writeFile(path.join(dir, "untracked.txt"), "u".repeat(50000));
+
+    const { listAllObjects } = await import("../src/objects.js");
+    const before = (await listAllObjects(gitDir)).length;
+    await status(gitDir, dir);
+    await status(gitDir, dir);
+    const after = (await listAllObjects(gitDir)).length;
+
+    assert.equal(after, before, "status must not create objects");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("plain file mode is 100644 on every platform", async () => {

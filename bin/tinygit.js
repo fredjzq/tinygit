@@ -20,6 +20,7 @@ const USAGE = [
   "  init [目录]                 初始化仓库",
   "  status                      工作区状态",
   "  add <路径...>               暂存文件",
+  "  rm <路径...>                从索引移除（保留工作区文件）",
   "  commit -m <消息>            提交",
   "  log [--oneline] [-n N]      提交历史",
   "",
@@ -84,6 +85,14 @@ async function main(argv) {
       if (!message) throw new Error("commit: 需要 -m <消息>");
       const result = await commit(gitDir, { message, allowEmpty: flags["allow-empty"] === true });
       log.success("[" + result.ref.replace(/^refs\/heads\//, "") + " " + result.oid.slice(0, 7) + "] " + message);
+      return 0;
+    }
+    case "rm": {
+      if (args.length === 0) throw new Error("rm: 需要至少一个路径");
+      const { removeFromIndex } = await import("../src/commands/add.js");
+      const n = await removeFromIndex(gitDir, args);
+      if (n === 0) log.info("没有匹配的已暂存文件");
+      else log.success("从索引移除 " + n + " 个文件（工作区文件保留）");
       return 0;
     }
     case "log": {

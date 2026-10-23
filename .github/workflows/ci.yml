@@ -40,6 +40,12 @@ jobs:
           echo 'export const y = 2;' >> src/a.js
           node "$GITHUB_WORKSPACE/bin/tinygit.js" add .
           node "$GITHUB_WORKSPACE/bin/tinygit.js" commit -m 'second commit'
+      - name: 独立审计器交叉验证
+        run: |
+          cd ${{ runner.temp }}
+          node "$GITHUB_WORKSPACE/scripts/audit.mjs" demo-repo --verbose
+          echo '独立审计器通过（不复用 src/ 代码，构成真正的交叉验证）'
+
       - name: 独立验证器校验格式
         run: node scripts/verify.mjs "${{ runner.temp }}/demo-repo"
       - name: 用真正的 git 打开它（最关键的一条）

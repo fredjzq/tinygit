@@ -102,13 +102,15 @@ export function buildIdx(entries, packChecksum) {
   head.writeUInt32BE(2, 4);
 
   const body = Buffer.concat([head, fanout, shaTable, crcTable, offTable, ...largeOffsets]);
-  // 尾部顺序与覆盖范围（实测真 git 的行为）：
-  //   body                 ← 索引主体
-  //   packChecksum (20)    ← pack 文件内容的 sha1，不计入 idx 自校验
-  //   idxChecksum  (20)    ← sha1(body)，**不含** packChecksum
-  // 容易误以为 idx 校验和覆盖到 pack 校验和，实际不覆盖。
-  const idxChecksum = createHash("sha1").update(body).digest();
-  return Buffer.concat([body, packChecksum, idxChecksum]);
+  // 尾部结构（与真 git 逐字节一致，用 3513 对象的真实 idx 验证过）：
+  //   body              ← 索引主体
+  //   packChecksum (20) ← pack 文件内容的 sha1（等于 pack 文件名里的 sha）
+  //   idxChecksum  (20) ← sha1(body + packChecksum)，**包含** pack 校验和
+  //
+  // 这里曾经写成只覆盖 body，导致与真 git 不一致。
+  const withPackChecksum = Buffer.concat([body, packChecksum]);
+  const idxChecksum = createHash("sha1").update(withPackChecksum).digest();
+  return Buffer.concat([withPackChecksum, idxChecksum]);
 }
 
 // CRC32（idx 里用于校验每个对象的压缩数据）。查表法，与 zlib 的 crc32 一致。

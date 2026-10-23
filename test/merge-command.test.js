@@ -178,6 +178,94 @@ test("conflicting merge reports conflict and leaves markers", async () => {
   });
 });
 
+test("resolving a conflict and committing keeps BOTH parents", async () => {
+  await withRepo(async ({ dir, gitDir }) => {
+    await writeFile(path.join(dir, "f.txt"), "a\nb\nc\n");
+    await add(gitDir, dir, ["."]);
+    const c0 = await commit(gitDir, { message: "base" });
+
+    await createBranch(gitDir, "feature");
+    await writeFile(path.join(dir, "f.txt"), "a\nM\nc\n");
+    await add(gitDir, dir, ["."]);
+    const cm = await commit(gitDir, { message: "main change" });
+
+    await switchBranch(gitDir, dir, "feature");
+    await writeFile(path.join(dir, "f.txt"), "a\nF\nc\n");
+    await add(gitDir, dir, ["."]);
+    const cfeat = await commit(gitDir, { message: "feature change" });
+    await switchBranch(gitDir, dir, "main");
+
+    const r = await merge(gitDir, dir, "feature");
+    assert.equal(r.result, "conflict");
+
+    // 冲突时必须留下 MERGE_HEAD，否则后续 commit 不知道这是合并
+    const mergeHead = await readFile(path.join(gitDir, "MERGE_HEAD"), "utf8");
+    assert.equal(mergeHead.trim(), cfeat.oid);
+
+    // 人工解决
+    await writeFile(path.join(dir, "f.txt"), "a\nRESOLVED\nc\n");
+    await add(gitDir, dir, ["."]);
+    const resolved = await commit(gitDir, { message: "merge resolved" });
+
+    // 关键断言：解决后的提交必须是双亲合并提交
+    // （曾经只写 1 个 parent，导致 feature 分支历史凭空消失）
+    const rc = await readCommit(gitDir, resolved.oid);
+    assert.equal(rc.parents.length, 2);
+    assert.deepEqual(new Set(rc.parents), new Set([cm.oid, cfeat.oid]));
+
+    // 两个分支的历史都必须可达
+    const seen = new Set();
+    const stack = [resolved.oid];
+    while (stack.length) {
+      const oid = stack.pop();
+      if (seen.has(oid)) continue;
+      seen.add(oid);
+      const c = await readCommit(gitDir, oid);
+      stack.push(...c.parents);
+    }
+    assert.ok(seen.has(c0.oid), "base commit must remain reachable");
+    assert.ok(seen.has(cm.oid), "main-side commit must remain reachable");
+    assert.ok(seen.has(cfeat.oid), "feature-side commit must remain reachable");
+
+    // 合并状态必须被清理
+    await assert.rejects(
+      () => readFile(path.join(gitDir, "MERGE_HEAD"), "utf8"),
+      (err) => err.code === "ENOENT"
+    );
+
+    // 再次合并应为 up-to-date，而不是重复冲突
+    const again = await merge(gitDir, dir, "feature");
+    assert.equal(again.result, "up-to-date");
+  });
+});
+
+test("a non-conflicting merge does not leave MERGE_HEAD behind", async () => {
+  await withRepo(async ({ dir, gitDir }) => {
+    await writeFile(path.join(dir, "f.txt"), "1\n2\n3\n");
+    await add(gitDir, dir, ["."]);
+    await commit(gitDir, { message: "base" });
+
+    await createBranch(gitDir, "feature");
+    await writeFile(path.join(dir, "head.txt"), "main side\n");
+    await add(gitDir, dir, ["."]);
+    await commit(gitDir, { message: "main" });
+
+    await switchBranch(gitDir, dir, "feature");
+    await writeFile(path.join(dir, "tail.txt"), "feature side\n");
+    await add(gitDir, dir, ["."]);
+    await commit(gitDir, { message: "feature" });
+    await switchBranch(gitDir, dir, "main");
+
+    const r = await merge(gitDir, dir, "feature");
+    assert.equal(r.result, "merged");
+
+    await assert.rejects(
+      () => readFile(path.join(gitDir, "MERGE_HEAD"), "utf8"),
+      (err) => err.code === "ENOENT"
+    );
+  });
+});
+
 test("merge base is the common ancestor, not the branch tip", async () => {
   await withRepo(async ({ dir, gitDir }) => {
     await write(dir, "a.txt", "1\n");

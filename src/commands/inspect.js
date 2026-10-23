@@ -23,9 +23,3 @@ export async function lsTree(gitDir, oid) {
 export function formatLsTree(entries) {
   return entries.map((e) => e.mode + " " + e.type + " " + e.oid + "\t" + e.name).join("\n") + "\n";
 }
-
-export async function hashObjectFromString(gitDir, text) {
-  const { writeObject } = await import("../objects.js");
-  const oid = await writeObject(gitDir, "blob", Buffer.from(text, "utf8"));
-  return oid;
-}

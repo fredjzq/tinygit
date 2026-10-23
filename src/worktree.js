@@ -43,6 +43,3 @@ export async function readFileForBlob(abs) {
   return { content: buf, mode: executable ? "100755" : "100644", size: st.size, stat: st };
 }
 
-export async function fileStatSafe(abs) {
-  try { return await stat(abs); } catch { return null; }
-}

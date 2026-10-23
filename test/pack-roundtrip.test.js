@@ -117,9 +117,33 @@ test("idx trailer holds pack checksum then idx checksum", async () => {
   const parsed = parseIdx(idx);
   assert.equal(parsed.packChecksum, packChecksum);
 
-  // idx 自身校验和只覆盖索引主体，不包含前面的 pack 校验和
-  const body = idx.subarray(0, idx.length - 40);
+  // idx 自身校验和覆盖 [0, len-20)，即包含前面的 pack 校验和
+  const body = idx.subarray(0, idx.length - 20);
   assert.equal(parsed.idxChecksum, createHash("sha1").update(body).digest("hex"));
+});
+
+test("verifyIdxChecksum accepts our own idx output", async () => {
+  const { verifyIdxChecksum } = await import("../src/pack/idx.js");
+  const { idx } = buildPack([
+    { type: "blob", content: "a" },
+    { type: "blob", content: "b".repeat(1000) },
+  ]);
+  const r = verifyIdxChecksum(idx);
+  assert.equal(r.ok, true, "our idx must satisfy the same rule git uses");
+});
+
+test("idx self-checksum covers the pack checksum (git semantics)", async () => {
+  const { createHash } = await import("node:crypto");
+  const { idx } = buildPack([{ type: "blob", content: "semantics" }]);
+
+  // 覆盖 [0, len-20)：包含 pack 校验和
+  const covering = createHash("sha1").update(idx.subarray(0, idx.length - 20)).digest("hex");
+  // 只覆盖 [0, len-40)：不含 pack 校验和
+  const notCovering = createHash("sha1").update(idx.subarray(0, idx.length - 40)).digest("hex");
+
+  const trailer = idx.subarray(idx.length - 20).toString("hex");
+  assert.equal(trailer, covering, "trailer must be sha1 over everything except itself");
+  assert.notEqual(trailer, notCovering, "trailer must NOT exclude the pack checksum");
 });
 
 test("crc32 matches the zlib definition", () => {

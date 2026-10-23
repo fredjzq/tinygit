@@ -13,6 +13,8 @@
 // fanout 表是性能关键：查某个 sha 时，用首字节直接查出区间，
 // 只需在该区间内二分，而不是全表二分。
 
+import { createHash } from "node:crypto";
+
 export const IDX_MAGIC = 0xff744f63;
 
 export function parseIdx(buf) {
@@ -89,10 +91,15 @@ export function findOffset(idx, shaHex) {
   return { found: false };
 }
 
-// 验证 idx 自身校验和：覆盖 [0, len-40) 的 body，不含 pack 校验和。
+// 验证 idx 自身校验和。
+//
+// 覆盖范围是 [0, len-20)，即**包含**紧邻它的 pack 校验和。
+// 这一点用真实 git 生成的 3513 对象 idx 文件实测确认：
+//   末尾 [len-40, len-20) = pack 内容的 sha1（也等于 pack 文件名里的 sha）
+//   末尾 [len-20, len)    = sha1(前面所有内容，含上面那 20 字节)
+// 起初误以为只覆盖索引主体，导致 writer 与真 git 不一致，已修正。
 export function verifyIdxChecksum(buf) {
-  const { createHash } = require("node:crypto");
   const expected = buf.subarray(buf.length - 20).toString("hex");
-  const actual = createHash("sha1").update(buf.subarray(0, buf.length - 40)).digest("hex");
+  const actual = createHash("sha1").update(buf.subarray(0, buf.length - 20)).digest("hex");
   return { ok: expected === actual, expected, actual };
 }

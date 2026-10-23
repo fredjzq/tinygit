@@ -31,11 +31,6 @@ export async function readHeadRef(gitDir) {
   throw new Error("HEAD: symbolic ref chain too deep (possible loop)");
 }
 
-export async function resolveHead(gitDir) {
-  const { ref, oid } = await readHeadRef(gitDir);
-  return { ref, oid };
-}
-
 export async function readRef(gitDir, ref) {
   try {
     const text = await readFile(path.join(gitDir, ref), "utf8");

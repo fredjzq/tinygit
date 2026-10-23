@@ -9,7 +9,6 @@
 //   <message>
 
 import { readObject, writeObject } from "./objects.js";
-import { objectExists } from "./objects.js";
 
 export function formatTimezone(offsetMinutes) {
   const sign = offsetMinutes < 0 ? "-" : "+";
@@ -85,6 +84,3 @@ export async function readCommit(gitDir, oid) {
   return parseCommit(text);
 }
 
-export async function commitExists(gitDir, oid) {
-  return objectExists(gitDir, oid);
-}

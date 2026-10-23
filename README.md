@@ -47,6 +47,7 @@ node scripts/demo.mjs
 | `log [--oneline] [-n N]` | 沿 parent 链回溯历史 |
 | `diff [--staged] [<a> <b>]` | Myers 算法，输出 unified diff |
 | `branch [-d <名>] [<名>]` | 列出 / 创建 / 删除分支 |
+| `rm <路径...>` | 从索引移除（保留工作区文件）|
 | `merge <分支>` | 快进或三方归并，冲突时写标记文件 |
 | `pack-info` | 统计 `.git/objects/pack` 里的打包对象 |
 | `checkout <分支>` | 切换分支并检出文件 |
@@ -138,8 +139,23 @@ THEIRS
 node --test
 ```
 
-**110 项测试**，覆盖对象哈希常量、tree 排序、索引字节布局、diff 最短性、
+**128 项测试**，覆盖对象哈希常量、tree 排序、索引字节布局、diff 最短性、
 pack 变长整数、delta 应用、pack 写入读取闭环、真实 pack 解析、三方归并、merge base。
+
+### 独立审计器（`scripts/audit.mjs`）
+
+故意**不复用任何 `src/` 代码**，从头实现 Git 的读取规则，
+构成真正的交叉验证。如果审计器调用被测代码，同一处 bug 会让两边一起错、一起「通过」。
+
+`bash`
+node scripts/audit.mjs <仓库路径> --verbose
+`
+
+覆盖 112~129 项检查，包括对象内容寻址一致性、tree 条目 mode 合法性、
+tree 排序、提交图可达性、索引校验和与排序、索引与工作区一致性、孤儿对象检测。
+
+**审计器本身经过反面测试**：人为篡改对象内容 / 索引校验和 / 制造孤儿对象 / 
+写坏分支指针，四种损坏全部被检出 —— 确认它不会永远返回「通过」。
 
 ### 独立验证器
 
@@ -201,7 +217,7 @@ src/
 scripts/
   demo.mjs            端到端演示
   verify.mjs          独立格式验证器
-test/                 110 项测试
+test/                 128 项测试
 ```
 
 ## License

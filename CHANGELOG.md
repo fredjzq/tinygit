@@ -1,5 +1,87 @@
 # 变更日志
 
+## 1.1.1
+
+全面检查维护：修掉 5 个真实缺陷，其中 2 个会导致数据错误。
+
+### 严重缺陷（会丢数据）
+
+**1. 解决合并冲突后，被合并分支的历史消失**
+
+冲突时没有写 ``MERGE_HEAD``，``commit`` 也就不知道正处于合并状态，
+于是解决冲突后的提交只有 **1 个 parent**。后果：
+
+- 被合并分支的提交从提交图里彻底丢失（实测可达提交从 4 降到 3）
+- 之后再次 merge 会重复报冲突，因为 git 认为从未合并过
+
+修复：冲突时写 ``MERGE_HEAD`` / ``MERGE_MSG``，``commit`` 读取它并写入第二个 parent，成功后清理。
+
+**2. `status` 会往对象库写东西**
+
+为了比较内容是否变化，``status`` 调用了 ``writeObject`` —— 这会真正落盘。
+结果是「只跑一次 ``status``」就往 ``.git/objects`` 塞入所有未跟踪文件的 blob，
+违背 git 语义（``git status`` 是纯只读操作），对大文件尤其浪费。
+
+修复：改用 ``hashObject``（只算哈希不落盘）。
+
+### 功能缺陷
+
+**3. `log` 只沿 first-parent 遍历**
+
+合并后只显示一侧历史，另一分支的提交完全不出现。真 git 会遍历所有 parent。
+
+修复：改为提交图遍历 + 拓扑序排序。顺带解决了「同一秒创建的提交排序错乱」问题
+（只按时间戳排序会退化成插入顺序，可能把父提交排到子提交前面）。
+
+**4. `verifyIdxChecksum` 在 ESM 模块里用 ``require()``**
+
+调用即抛 ``ReferenceError: require is not defined``。修复为顶部 ``import``。
+
+**5. idx 自校验和覆盖范围错误**
+
+上一版认为覆盖 ``[0, len-40)``（不含 pack 校验和），**实际是 ``[0, len-20)``（包含）**。
+用真实 git 的 3,513 对象 idx 文件实测确认：末尾 40 字节中，前 20 是 pack 校验和，
+后 20 是「包含前 20 字节」的 sha1。已同步修正 ``writer.js``，现在自己生成的 idx 与真 git 语义一致。
+
+### 新增：pack 读取真正接入
+
+pack 解析器此前只存在于独立测试里，**``readObject`` 并未使用它**，
+导致所有命令遇到打包对象都报 ``packed objects are not supported`` —— 
+单元测试全绿，真实使用全废。
+
+现在 ``readObject`` / ``objectExists`` 都会回退到 pack，
+并新增 ``listAllObjects`` 统一列出松散 + 打包对象。pack 读取器带签名缓存，
+pack 文件变化（fetch / gc / 测试改目录）时自动重建。
+
+### 新增命令
+
+- ``tinygit rm <路径...>``：从索引移除（此前 ``removeFromIndex`` 有实现但无入口）
+- ``tinygit status`` 在合并冲突期间会显示 Unmerged paths 与解决提示
+
+### 死代码清理
+
+删除 5 个未被引用的导出：``resolveHead``（与 readHeadRef 重复）、``commitExists``、
+``fileStatSafe``、``countFilesInCommit``、``hashObjectFromString``。
+``merge.js`` 改用 ``canFastForward``，消除重复的祖先判断。
+
+### 新增审计工具
+
+``scripts/audit.mjs``：独立审计器，**不复用任何 src/ 代码**，从头实现 Git 读取规则。
+覆盖对象内容寻址、tree mode 合法性、tree 排序、提交图可达性、索引校验和、
+索引与工作区一致性、孤儿对象检测等 112~129 项检查。
+
+审计器自身经过反面测试：篡改对象 / 篡改索引 / 造孤儿 / 写坏指针，四种损坏全部被检出。
+
+### 测试
+
+从 110 项增至 **128 项**，新增覆盖：
+
+- 打包仓库端到端（10 项）：命令能否读 pack、缓存失效、松散与打包共存
+- 合并冲突解决后双亲正确性（2 项）
+- ``log`` 遍历全部 parent、拓扑序、limit（3 项）
+- ``status`` 无副作用（1 项）
+- idx 校验和语义（2 项）
+
 ## 1.1.0
 
 难度提升：从「只读写松散对象」升级到「能读真 Git 的打包仓库」，并支持三方合并。

@@ -11,11 +11,11 @@ import { readHeadRef, readRef, writeRef, updateHead } from "../refs.js";
 import { readCommit, writeCommit, formatIdentity, localTimezoneOffset } from "../commit.js";
 import { flattenTree } from "../tree.js";
 import { readObject, writeObject } from "../objects.js";
-import { findMergeBase, isAncestor } from "../merge-base.js";
+import { findMergeBase, isAncestor, canFastForward } from "../merge-base.js";
 import { merge3, renderMergedFile } from "../merge-file.js";
 import { readIndex, writeIndex, entryFromStat } from "../index-file.js";
 import { writeTreeFromEntries } from "../tree.js";
-import { readFile, writeFile, mkdir, stat } from "node:fs/promises";
+import { readFile, writeFile, mkdir, stat, rm } from "node:fs/promises";
 import path from "node:path";
 
 export async function merge(gitDir, rootDir, branchName, {
@@ -38,8 +38,8 @@ export async function merge(gitDir, rootDir, branchName, {
     return { result: "up-to-date", branch: branchName };
   }
 
-  // 情况 2：快进
-  if (await isAncestor(gitDir, head.oid, targetOid)) {
+  // 情况 2：快进（当前 HEAD 是目标分支的祖先）
+  if (await canFastForward(gitDir, head.oid, targetOid)) {
     await updateHead(gitDir, targetOid);
     return { result: "fast-forward", branch: branchName, oid: targetOid };
   }
@@ -121,8 +121,22 @@ export async function merge(gitDir, rootDir, branchName, {
   }
 
   if (conflicts.length > 0) {
+    // 留下「正在合并」的状态，与真 git 一致：
+    //   MERGE_HEAD 记录被合并分支的提交
+    //   MERGE_MSG  记录建议的提交信息
+    // 用户解决冲突后执行 commit，commit 会据此写入第二个 parent。
+    // 少了这一步，解决冲突后的提交只有一个 parent，被合并分支的历史会凭空消失。
+    await writeFile(path.join(gitDir, "MERGE_HEAD"), targetOid + "\n");
+    await writeFile(
+      path.join(gitDir, "MERGE_MSG"),
+      "Merge branch '" + branchName + "' into " + currentBranch + "\n"
+    );
     return { result: "conflict", branch: branchName, conflicts, baseOid };
   }
+
+  // 成功合并没有冲突，确保不残留合并状态
+  await rm(path.join(gitDir, "MERGE_HEAD"), { force: true });
+  await rm(path.join(gitDir, "MERGE_MSG"), { force: true });
 
   // 重建索引与 tree
   const entries = [];
