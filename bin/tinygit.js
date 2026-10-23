@@ -50,7 +50,7 @@ async function main(argv) {
   }
 
   if (command === "version" || flags.version) {
-    console.log("tinygit 1.0.0");
+    console.log("tinygit 1.1.1");
     return 0;
   }
 
