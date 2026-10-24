@@ -184,7 +184,7 @@ jobs:
         with:
           node-version: 20
       - name: 协议与 clone 测试（本地模拟服务器，无需网络）
-        run: node --test test/pkt-line.test.js test/transport.test.js
+        run: node --test test/pkt-line.test.js test/transport.test.js test/cherry-pick-rebase.test.js
       - name: 验证 clone 出的仓库能被独立审计器校验
         run: |
           cd ${{ runner.temp }}

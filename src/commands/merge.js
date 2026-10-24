@@ -6,16 +6,17 @@
 //   3. 真合并：需要三方归并，可能产生冲突
 //
 // 冲突时不提交，把冲突内容写进工作区并留标记，与 Git 行为一致。
+//
+// 三方归并的实际逻辑在 ../merge-trees.js 里，与 cherry-pick / rebase 共用。
+// 这里只负责「选择哪三个提交作为 base / ours / theirs」以及提交的生成。
 
 import { readHeadRef, readRef, writeRef, updateHead } from "../refs.js";
 import { readCommit, writeCommit, formatIdentity, localTimezoneOffset } from "../commit.js";
-import { flattenTree } from "../tree.js";
-import { readObject, writeObject } from "../objects.js";
+import { flattenTree, writeTreeFromEntries } from "../tree.js";
 import { findMergeBase, isAncestor, canFastForward } from "../merge-base.js";
-import { merge3, renderMergedFile } from "../merge-file.js";
-import { readIndex, writeIndex, entryFromStat } from "../index-file.js";
-import { writeTreeFromEntries } from "../tree.js";
-import { readFile, writeFile, mkdir, stat, rm } from "node:fs/promises";
+import { mergeTreeStates, applyWorktree } from "../merge-trees.js";
+import { writeIndex, entryFromStat } from "../index-file.js";
+import { writeFile, stat, rm } from "node:fs/promises";
 import path from "node:path";
 
 export async function merge(gitDir, rootDir, branchName, {
@@ -52,73 +53,14 @@ export async function merge(gitDir, rootDir, branchName, {
   const oursFiles = await filesOfCommit(gitDir, head.oid);
   const theirsFiles = await filesOfCommit(gitDir, targetOid);
 
-  const allPaths = new Set([...baseFiles.keys(), ...oursFiles.keys(), ...theirsFiles.keys()]);
-  const mergedFiles = new Map();   // path -> oid
-  const conflicts = [];
-
-  for (const p of allPaths) {
-    const baseEntry = baseFiles.get(p);
-    const oursEntry = oursFiles.get(p);
-    const theirsEntry = theirsFiles.get(p);
-
-    const baseText = baseEntry ? await textOf(gitDir, baseEntry.oid) : null;
-    const oursText = oursEntry ? await textOf(gitDir, oursEntry.oid) : null;
-    const theirsText = theirsEntry ? await textOf(gitDir, theirsEntry.oid) : null;
-
-    // 二进制文件：不做归并，有分歧就冲突
-    if (baseText === null || oursText === null || theirsText === null) {
-      const oursSig = oursEntry?.oid ?? null;
-      const theirsSig = theirsEntry?.oid ?? null;
-      if (oursSig === theirsSig) {
-        if (oursSig) mergedFiles.set(p, oursSig);
-      } else if (oursSig === (baseEntry?.oid ?? null)) {
-        if (theirsSig) mergedFiles.set(p, theirsSig);
-      } else if (theirsSig === (baseEntry?.oid ?? null)) {
-        if (oursSig) mergedFiles.set(p, oursSig);
-      } else {
-        conflicts.push({ path: p, binary: true });
-      }
-      continue;
-    }
-
-    // 一边没变 → 直接采用另一边（这是最常见的快路径）
-    if (oursText === baseText) {
-      if (theirsEntry) {
-        mergedFiles.set(p, theirsEntry.oid);
-        await writeWorktreeFile(rootDir, p, theirsText);
-      } else {
-        await removeWorktreeFile(rootDir, p);
-      }
-      continue;
-    }
-    if (theirsText === baseText) {
-      if (oursEntry) {
-        mergedFiles.set(p, oursEntry.oid);
-      }
-      continue;
-    }
-
-    // 两边都改了 → 三路归并
-    const base = splitLines(baseText);
-    const ours = splitLines(oursText);
-    const theirs = splitLines(theirsText);
-    const { merged, conflicts: fileConflicts } = merge3(base, ours, theirs);
-
-    if (fileConflicts.length === 0) {
-      const content = merged.length ? merged.join("\n") + "\n" : "";
-      const oid = await writeObject(gitDir, "blob", Buffer.from(content, "utf8"));
-      mergedFiles.set(p, oid);
-      await writeWorktreeFile(rootDir, p, content);
-    } else {
-      // 冲突：按 Git 标记格式生成完整文件，保留在 working tree 供人工解决
-      const rendered = renderMergedFile(base, ours, theirs, {
-        oursLabel: currentBranch,
-        theirsLabel: branchName,
-      });
-      await writeWorktreeFile(rootDir, p, rendered.lines.join("\n") + "\n");
-      conflicts.push({ path: p, regions: fileConflicts.length });
-    }
-  }
+  const { mergedFiles, conflicts, worktree } = await mergeTreeStates(gitDir, {
+    baseFiles,
+    oursFiles,
+    theirsFiles,
+    oursLabel: currentBranch,
+    theirsLabel: branchName,
+  });
+  await applyWorktree(rootDir, worktree);
 
   if (conflicts.length > 0) {
     // 留下「正在合并」的状态，与真 git 一致：
@@ -140,13 +82,12 @@ export async function merge(gitDir, rootDir, branchName, {
 
   // 重建索引与 tree
   const entries = [];
-  for (const [p, oid] of mergedFiles) {
+  for (const [p, entry] of mergedFiles) {
     const abs = path.join(rootDir, p);
     const st = await stat(abs);
-    entries.push(entryFromStat(p, oid, "100644", st));
+    entries.push(entryFromStat(p, entry.oid, entry.mode, st));
   }
-  const index = { version: 2, entries };
-  await writeIndex(gitDir, index);
+  await writeIndex(gitDir, { version: 2, entries });
 
   if (noCommit) {
     return { result: "merged-not-committed", branch: branchName, baseOid };
@@ -178,28 +119,4 @@ export async function merge(gitDir, rootDir, branchName, {
 async function filesOfCommit(gitDir, commitOid) {
   const commit = await readCommit(gitDir, commitOid);
   return flattenTree(gitDir, commit.tree);
-}
-
-async function textOf(gitDir, oid) {
-  const { content } = await readObject(gitDir, oid);
-  if (content.includes(0)) return null;   // 二进制
-  return content.toString("utf8");
-}
-
-function splitLines(text) {
-  if (text === "") return [];
-  const lines = text.split("\n");
-  if (lines[lines.length - 1] === "") lines.pop();
-  return lines;
-}
-
-async function writeWorktreeFile(rootDir, rel, content) {
-  const abs = path.join(rootDir, rel);
-  await mkdir(path.dirname(abs), { recursive: true });
-  await writeFile(abs, content);
-}
-
-async function removeWorktreeFile(rootDir, rel) {
-  const { unlink } = await import("node:fs/promises");
-  try { await unlink(path.join(rootDir, rel)); } catch { }
 }

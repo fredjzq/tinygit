@@ -41,6 +41,10 @@ const USAGE = [
   "  branch [-d <名>] [<名>]     列出/创建/删除分支",
   "  checkout <分支>             切换分支",
   "  merge <分支>                合并分支（快进/三方归并）",
+  "  cherry-pick <提交>          把某个提交的改动摘到当前分支",
+  "  rebase <分支>               把当前分支重放到另一基点",
+  "  rebase --continue           解决冲突后继续",
+  "  rebase --abort              放弃 rebase 回到原位置",
   "",
   "远程:",
   "  clone <url> [目录]          克隆远程仓库",
@@ -57,13 +61,14 @@ const USAGE = [
 async function main(argv) {
   const { command, args, flags } = parseArgs(argv);
 
-  if (!command || command === "help" || flags.help) {
-    console.log(USAGE);
+  // --version / -v 优先于 help：用户想查版本时不该被帮助文本淹没
+  if (command === "version" || flags.version === true) {
+    console.log("tinygit 1.4.0");
     return 0;
   }
 
-  if (command === "version" || flags.version) {
-    console.log("tinygit 1.3.0");
+  if (!command || command === "help" || flags.help === true) {
+    console.log(USAGE);
     return 0;
   }
 
@@ -268,6 +273,53 @@ async function main(argv) {
         log.success("下载 " + r.newObjects + " 个对象（" + (r.packSize / 1024).toFixed(0) + " KB）");
       }
       log.info("更新远程分支: " + r.branches + " 个");
+      return 0;
+    }
+    case "cherry-pick": {
+      if (args.length === 0) throw new Error("cherry-pick: 需要提交引用");
+      const { cherryPick } = await import("../src/commands/cherry-pick.js");
+      const r = await cherryPick(gitDir, rootDir, args[0], {});
+      if (r.result === "picked") {
+        log.success("已摘取 " + r.sourceOid.slice(0, 7) + " → " + r.oid.slice(0, 7));
+      } else if (r.result === "empty") {
+        log.info("改动已存在，未产生新提交");
+      } else if (r.result === "conflict") {
+        log.warn("冲突：" + r.conflicts.map((c) => c.path).join(", "));
+        log.info("手工解决后执行: tinygit add <文件> && tinygit commit -m <消息>");
+        return 1;
+      }
+      return 0;
+    }
+    case "rebase": {
+      const { rebase } = await import("../src/commands/rebase.js");
+      if (flags.abort === true) {
+        const r = await rebase(gitDir, rootDir, null, { abort: true });
+        log.success("已回滚到 " + r.head.slice(0, 7) + "（" + r.branch + "）");
+        return 0;
+      }
+      if (flags.continue === true) {
+        const r = await rebase(gitDir, rootDir, null, {});
+        if (r.result === "conflict") {
+          log.warn("仍有冲突：" + (r.conflicts ?? []).map((c) => c.path).join(", "));
+          return 1;
+        }
+        log.success("rebase 完成，重放 " + r.replayed + " 个提交");
+        return 0;
+      }
+      if (args.length === 0) throw new Error("rebase: 需要目标分支（或 --abort / --continue）");
+      const r = await rebase(gitDir, rootDir, args[0]);
+      if (r.result === "up-to-date") {
+        log.info("已经在 " + args[0] + " 之上，无需 rebase");
+        return 0;
+      }
+      if (r.result === "conflict") {
+        log.warn("在 " + (r.current ?? "").slice(0, 7) + " 处冲突：" + r.conflicts.map((c) => c.path).join(", "));
+        log.info("解决后: tinygit add <文件> && tinygit rebase --continue");
+        log.info("放弃: tinygit rebase --abort");
+        return 1;
+      }
+      log.success("rebase 完成：" + r.branch + " 现有 " + r.replayed + " 个提交重放到新基点");
+      if (r.skipped > 0) log.info("跳过 " + r.skipped + " 个空提交");
       return 0;
     }
     case "pack-info": {

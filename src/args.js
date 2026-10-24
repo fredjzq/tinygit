@@ -8,7 +8,11 @@ const SHORT_WITH_VALUE = new Set(["m", "n"]);
 export function parseArgs(argv) {
   const out = { command: null, args: [], flags: {} };
   const list = [...argv];
-  out.command = list.shift() ?? null;
+
+  // 第一个参数如果是选项（--version、--help）而不是命令，
+  // 不能把它当命令名——否则 tinygit --version 会被当成
+  // 「执行名为 --version 的命令」，报错说不在仓库内。
+  out.command = list.length > 0 && !list[0].startsWith("-") ? list.shift() : null;
 
   while (list.length > 0) {
     const token = list.shift();
