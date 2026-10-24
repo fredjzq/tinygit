@@ -42,6 +42,10 @@ const USAGE = [
   "  checkout <分支>             切换分支",
   "  merge <分支>                合并分支（快进/三方归并）",
   "",
+  "远程:",
+  "  clone <url> [目录]          克隆远程仓库",
+  "  fetch <url>                 抓取远程更新",
+  "",
   "维护:",
   "  gc [--dry-run]              打包松散对象并清理（支持 delta 压缩）",
   "  gc --pack-refs              把分支引用写入 packed-refs",
@@ -59,7 +63,7 @@ async function main(argv) {
   }
 
   if (command === "version" || flags.version) {
-    console.log("tinygit 1.2.0");
+    console.log("tinygit 1.3.0");
     return 0;
   }
 
@@ -70,6 +74,28 @@ async function main(argv) {
       force: flags.force === true,
     });
     log.success("初始化仓库 " + path.relative(process.cwd(), gitDir));
+    return 0;
+  }
+
+  // clone 和 init 一样不能要求「已经在仓库内」——
+  // 它的目的就是创建一个新仓库。
+  if (command === "clone") {
+    const url = args[0];
+    if (!url) throw new Error("clone: 需要仓库地址");
+    const targetDir = args[1] ?? url.split("/").filter(Boolean).pop().replace(/\.git$/, "");
+    const { clone } = await import("../src/commands/fetch.js");
+    const branch = typeof flags.b === "string" ? flags.b : (typeof flags.branch === "string" ? flags.branch : null);
+    const depth = typeof flags.depth === "string" ? Number(flags.depth) : null;
+    const token = process.env.GITHUB_TOKEN ?? process.env.GIT_TOKEN ?? null;
+    const r = await clone(url, targetDir, {
+      branch, depth,
+      auth: token ? { token } : null,
+      onProgress: (m) => log.info(m),
+    });
+    log.success("克隆完成: " + targetDir);
+    log.info("分支: " + r.branch + "  提交: " + r.head.slice(0, 7));
+    log.info("检出文件: " + r.fileCount + "  对象: " + r.objectCount);
+    log.info("pack: " + (r.packSize / 1024).toFixed(0) + " KB");
     return 0;
   }
 
@@ -225,6 +251,23 @@ async function main(argv) {
       log.success("打包 " + r.packed + " 个对象（其中 delta " + r.deltaCount + " 个）");
       log.info("pack 大小: " + formatBytes(r.packSize) + "  文件名: " + r.packName);
       log.info("清理松散对象: " + r.removed + "/" + r.looseBefore + " 个");
+      return 0;
+    }
+    case "fetch": {
+      const url = args[0];
+      if (!url) throw new Error("fetch: 需要仓库地址");
+      const { fetch: fetchCmd } = await import("../src/commands/fetch.js");
+      const token = process.env.GITHUB_TOKEN ?? process.env.GIT_TOKEN ?? null;
+      const r = await fetchCmd(gitDir, rootDir, url, {
+        auth: token ? { token } : null,
+        onProgress: (m) => log.info(m),
+      });
+      if (r.negotiated) {
+        log.info("已是最新，无需下载对象");
+      } else {
+        log.success("下载 " + r.newObjects + " 个对象（" + (r.packSize / 1024).toFixed(0) + " KB）");
+      }
+      log.info("更新远程分支: " + r.branches + " 个");
       return 0;
     }
     case "pack-info": {

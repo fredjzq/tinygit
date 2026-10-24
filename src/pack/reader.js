@@ -275,3 +275,36 @@ export function resolvePackObjects(buf, externalLookup = null) {
   for (const offset of order) resolve(offset);
   return { byOid, resolved, oidByOffset, count, order };
 }
+
+// 列出 pack 内每个对象的 (sha, offset, 字节区间)。
+//
+// 为什么单独提供：从网络收到的 pack 需要重建 idx，而 idx 要求
+// 每个对象的偏移与「压缩数据 + 对象头」的 CRC32。
+// resolvePackObjects 能还原内容但丢了字节区间，所以这里单独走一遍
+// 轻量解析（不做 delta 还原，只定位边界）。
+export function listPackEntries(buf) {
+  const { count } = parsePackHeader(buf);
+  const { byOid, oidByOffset } = resolvePackObjects(buf);
+
+  const out = [];
+  let offset = 12;
+
+  for (let i = 0; i < count; i += 1) {
+    const start = offset;
+    const header = readObjectHeader(buf, offset);
+    const { length } = compressedLength(buf, header.dataStart, header.size);
+    offset = header.dataStart + length;
+
+    const oid = oidByOffset.get(start);
+    if (!oid) throw new Error("pack: no oid resolved for offset " + start);
+
+    out.push({
+      oid,
+      offset: start,
+      end: offset,
+      bytes: buf.subarray(start, offset),   // 对象头 + 压缩数据，用于 CRC
+    });
+  }
+
+  return { entries: out, byOid };
+}

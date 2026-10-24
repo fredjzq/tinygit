@@ -49,6 +49,8 @@ node scripts/demo.mjs
 | `branch [-d <名>] [<名>]` | 列出 / 创建 / 删除分支 |
 | `rm <路径...>` | 从索引移除（保留工作区文件）|
 | `merge <分支>` | 快进或三方归并，冲突时写标记文件 |
+| `clone <url> [目录]` | 从远程仓库克隆（智能 HTTP 协议） |
+| `fetch <url>` | 抓取远程更新，带 have/want 协商 |
 | `gc [--dry-run]` | 打包松散对象（含 delta 压缩）并清理 |
 | `gc --pack-refs` | 把分支引用写入 `packed-refs` |
 | `pack-info` | 统计 `.git/objects/pack` 里的打包对象 |
@@ -58,6 +60,39 @@ node scripts/demo.mjs
 | `hash-object <文件>` | 计算并写入 blob |
 
 ## 实现要点
+
+### 智能 HTTP 协议
+
+这是项目从「只能操作本地」到「能和真实世界交互」的分界线。
+\`clone\` 一个真实仓库要经过两个往返：
+
+1. \`GET /info/refs?service=git-upload-pack\` —— 服务端广告所有引用与能力集
+2. \`POST /git-upload-pack\` —— 发 want/have 协商，服务端回 packfile
+
+**帧格式（pkt-line）**：每帧是「4 位十六进制长度 + 载荷」，长度**包含 4 字节头本身**。
+三个特殊长度：\`0000\` flush（本轮说完）、\`0001\` delim（v2 分段）、\`0002\` response-end。
+
+**容易写错的三个地方**（每一条都会让协商静默失败）：
+
+- 长度忘了加 4 —— 整个流错位，解析出乱码
+- 首行按空格切分 —— 实际是 \`<sha> <ref>\0<capabilities>\`，能力集在 NUL 后面
+- side-band 通道号没处理 —— 通道 1 是 pack 数据、通道 2 是进度文本，
+  混在一起 pack 立刻损坏（开头不再是 \`PACK\`）
+
+**协商为什么重要**：只发 want 不发 have 时，服务端认为你什么都没有，
+每次都要传完整仓库。实测同一仓库：
+
+| 场景 | 传输量 | 耗时 |
+| --- | --- | --- |
+| 不提供 have | 705 KB | 1477 ms |
+| 提供 have（已是最新） | 0 KB | 86 ms |
+
+**index 必须自己重建**：服务端只发 pack，不发 \`.idx\`。重建需要每个对象的偏移
+与「对象头 + 压缩数据」的 CRC32。pack 文件名必须是内容哈希
+（\`pack-<sha1(内容去掉尾部20字节)>.pack\`），否则真 git 判定损坏。
+
+**检出后必须建索引**：空的索引会让 \`status\` 把刚检出的 171 个文件全报成「已删除」，
+第一次 commit 又会把它们全当新增——工作区看着正常，仓库状态完全错了。
 
 ### packfile 与 delta 压缩
 

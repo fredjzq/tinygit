@@ -1,5 +1,54 @@
 # 变更日志
 
+## 1.3.0
+
+这一版让项目从「只能操作本地仓库」变成「能和真实世界交互」：
+实现了 Git 的智能 HTTP 协议，可以 clone / fetch 真实远程仓库。
+
+实测从 gitee 克隆 git-osc（705 KB pack、954 个对象、171 个文件、445 个 delta），
+1.9 秒完成，独立审计器 18,636 项检查全部通过。
+
+### 新增
+
+- **pkt-line 帧协议**（\`src/transport/pkt-line.js\`）
+  4 位十六进制长度头 + 载荷，长度包含头本身。支持 flush / delim / response-end
+  三种特殊帧，以及 side-band 通道复用。
+- **智能 HTTP 协议客户端**（\`src/transport/smart-http.js\`）
+  \`info/refs\` 广告解析（含 NUL 分隔的能力集与 symref）、\`want/have\` 协商、
+  side-band 通道分离、非 PACK 数据校验。
+- **\`clone\` 命令**（\`src/commands/fetch.js\`）
+  抓取 → 落盘 pack → **从零重建 idx** → 建远程/本地引用 → 检出工作区 → 建索引。
+- **\`fetch\` 命令**
+  收集本地可达提交作为 \`have\`，实现增量协商。
+- **\`listPackEntries\`**（\`src/pack/reader.js\`）
+  列出每个对象的偏移与字节区间，供重建 idx 计算 CRC32。
+
+### 协商效果实测
+
+| 场景 | 传输量 | 耗时 |
+| --- | --- | --- |
+| 不提供 have | 705 KB | 1477 ms |
+| 提供 have（已是最新） | 0 KB | 86 ms |
+
+### 修复
+
+- **clone 后索引是空的**
+  检出写了 171 个文件，但索引仍是 \`emptyIndex\`。
+  后果：\`status\` 把这 171 个文件全报成「已删除」，第一次 commit 又把它们
+  全当新增——工作区看着正常，仓库状态完全错了。
+  修复后索引 171 条，\`status\` 显示 clean。
+- **\`clone\` 被 \`requireRepo\` 挡住**
+  命令入口统一要求「已在仓库内」，但 clone 的目的就是创建新仓库。
+  改为与 \`init\` 同级，在门禁之前处理。
+
+### 测试
+
+- 新增 \`test/pkt-line.test.js\`（11 项）：逐字节验证长度头、特殊帧、
+  不完整数据、二进制载荷
+- 新增 \`test/transport.test.js\`（10 项）：起本地 HTTP 服务器模拟 Git 服务端，
+  完全离线运行。覆盖广告解析、side-band 分离、clone 端到端、pack 校验和拒绝
+- 总计 **169 项测试**
+
 ## 1.2.0
 
 这一版补上了「让对象真正可维护」的完整链路：写 delta、打包、清理、引用打包。

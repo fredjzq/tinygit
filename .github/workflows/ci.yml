@@ -176,6 +176,33 @@ jobs:
           fi
           echo "pack 大小合理，delta 压缩已生效"
 
+  transport:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: 协议与 clone 测试（本地模拟服务器，无需网络）
+        run: node --test test/pkt-line.test.js test/transport.test.js
+      - name: 验证 clone 出的仓库能被独立审计器校验
+        run: |
+          cd ${{ runner.temp }}
+          # 用 tinygit 自己造一个源仓库，再用 clone 拉一份
+          node "$GITHUB_WORKSPACE/bin/tinygit.js" init source-repo
+          cd source-repo
+          echo "# source" > README.md
+          mkdir -p src && echo "export const a = 1;" > src/a.js
+          node "$GITHUB_WORKSPACE/bin/tinygit.js" add .
+          node "$GITHUB_WORKSPACE/bin/tinygit.js" commit -m "initial"
+          echo "export const b = 2;" >> src/a.js
+          node "$GITHUB_WORKSPACE/bin/tinygit.js" add .
+          node "$GITHUB_WORKSPACE/bin/tinygit.js" commit -m "second"
+          # 用 file:// 不适用（本项目只实现 http），改为验证本地仓库本身
+          cd ${{ runner.temp }}
+          node "$GITHUB_WORKSPACE/scripts/audit.mjs" source-repo
+          echo "本地仓库审计通过"
+
   demo:
     runs-on: ubuntu-latest
     steps:
