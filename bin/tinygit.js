@@ -11,6 +11,13 @@ import { initRepo } from "../src/repo.js";
 import { requireRepo } from "../src/context.js";
 import { log } from "../src/logger.js";
 
+// 人类可读的字节数。gc 输出 pack 大小时用。
+function formatBytes(n) {
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+  return (n / 1024 / 1024).toFixed(2) + " MB";
+}
+
 const USAGE = [
   "tinygit — 用纯 JavaScript 实现的 Git 子集",
   "",
@@ -35,7 +42,9 @@ const USAGE = [
   "  checkout <分支>             切换分支",
   "  merge <分支>                合并分支（快进/三方归并）",
   "",
-  "packfile:",
+  "维护:",
+  "  gc [--dry-run]              打包松散对象并清理（支持 delta 压缩）",
+  "  gc --pack-refs              把分支引用写入 packed-refs",
   "  pack-info                   显示打包对象统计",
   "",
   "退出码: 0 成功 · 1 用法/前置条件错误 · 2 内部异常",
@@ -50,7 +59,7 @@ async function main(argv) {
   }
 
   if (command === "version" || flags.version) {
-    console.log("tinygit 1.1.1");
+    console.log("tinygit 1.2.0");
     return 0;
   }
 
@@ -140,9 +149,15 @@ async function main(argv) {
     }
     case "branch": {
       const { branchList, createBranch, deleteBranch } = await import("../src/commands/branch.js");
-      if (flags.d) {
-        await deleteBranch(gitDir, String(flags.d), { force: flags.D === true });
-        log.success("删除分支 " + flags.d);
+      // 注意：-d / -D 在 parseArgs 里是布尔标志（不带值），
+      // 分支名落在位置参数 args 里。这里曾写成 flags.d 直接当名字用，
+      // 结果 String(true) 变成 "true"，报 branch not found: true，
+      // 而真正要删的分支根本没动。
+      if (flags.d || flags.D) {
+        const name = args[0] ?? (typeof flags.d === "string" ? flags.d : null);
+        if (!name) throw new Error("branch: -d 需要一个分支名");
+        await deleteBranch(gitDir, name, { force: flags.D === true });
+        log.success("删除分支 " + name);
         return 0;
       }
       if (args[0]) {
@@ -183,6 +198,33 @@ async function main(argv) {
       } else {
         log.success("合并提交 " + r.oid.slice(0, 7) + "（合并基 " + (r.baseOid ?? "").slice(0, 7) + "）");
       }
+      return 0;
+    }
+    case "gc": {
+      const dryRun = Boolean(flags["dry-run"]) || args.includes("--dry-run");
+      const packRefsFlag = args.includes("--pack-refs") || flags["pack-refs"];
+      const { gc } = await import("../src/commands/gc.js");
+
+      if (packRefsFlag && !dryRun) {
+        const { repackRefs } = await import("../src/refs.js");
+        const n = await repackRefs(gitDir);
+        log.success("已把 " + n + " 个分支写入 packed-refs");
+        return 0;
+      }
+
+      const r = await gc(gitDir, { dryRun });
+      if (r.looseBefore === 0 && !dryRun) {
+        log.info("没有松散对象，无需打包");
+        return 0;
+      }
+      if (dryRun) {
+        log.info("[dry-run] 松散对象 " + r.looseBefore + " 个，可达 " + r.reachable + " 个");
+        log.info("预计打包后大小: " + formatBytes(r.packSize));
+        return 0;
+      }
+      log.success("打包 " + r.packed + " 个对象（其中 delta " + r.deltaCount + " 个）");
+      log.info("pack 大小: " + formatBytes(r.packSize) + "  文件名: " + r.packName);
+      log.info("清理松散对象: " + r.removed + "/" + r.looseBefore + " 个");
       return 0;
     }
     case "pack-info": {

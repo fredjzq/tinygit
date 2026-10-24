@@ -86,6 +86,96 @@ jobs:
           echo '真 git 确认这是合法的双亲合并提交'
           cat f.txt
 
+  gc-and-delta:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: 造一个有大量历史版本的仓库
+        run: |
+          cd ${{ runner.temp }}
+          node "$GITHUB_WORKSPACE/bin/tinygit.js" init gc-demo
+          cd gc-demo
+          # 每次只改几行，制造「同一文件的历史版本」——
+          # 这正是 delta 压缩最能发挥作用的场景
+          for v in $(seq 1 20); do
+            {
+              echo "header line for version $v"
+              for i in $(seq 1 80); do
+                if [ "$i" = "$v" ]; then
+                  echo "row $i CHANGED at version $v"
+                else
+                  echo "row $i stable content"
+                fi
+              done
+            } > data.txt
+            node "$GITHUB_WORKSPACE/bin/tinygit.js" add .
+            node "$GITHUB_WORKSPACE/bin/tinygit.js" commit -m "version $v"
+          done
+
+      - name: 记录 gc 前的对象体积
+        run: |
+          cd ${{ runner.temp }}/gc-demo
+          BEFORE=$(du -sb .git/objects | cut -f1)
+          echo "gc 前 objects 目录: $BEFORE 字节"
+          echo "BEFORE=$BEFORE" >> $GITHUB_ENV
+          echo "松散对象数: $(find .git/objects -type f -not -path "*/pack/*" | wc -l)"
+
+      - name: 运行 gc（含 delta 压缩）
+        run: |
+          cd ${{ runner.temp }}/gc-demo
+          node "$GITHUB_WORKSPACE/bin/tinygit.js" gc --dry-run
+          node "$GITHUB_WORKSPACE/bin/tinygit.js" gc
+          node "$GITHUB_WORKSPACE/bin/tinygit.js" gc --pack-refs
+          AFTER=$(du -sb .git/objects | cut -f1)
+          echo "gc 后 objects 目录: $AFTER 字节"
+          echo "AFTER=$AFTER" >> $GITHUB_ENV
+
+      - name: 确认体积确实变小
+        run: |
+          echo "gc 前: $BEFORE  后: $AFTER"
+          if [ "$AFTER" -ge "$BEFORE" ]; then
+            echo "错误: gc 后体积没有变小"
+            exit 1
+          fi
+          echo "体积缩减 $(python3 -c "print(round((1-$AFTER/$BEFORE)*100,1))")%"
+
+      - name: 独立审计器校验 gc 后的仓库（含 pack 校验）
+        run: |
+          cd ${{ runner.temp }}
+          node "$GITHUB_WORKSPACE/scripts/audit.mjs" gc-demo
+          echo "审计器独立校验了 pack 与 idx，未复用 src/ 代码"
+
+      - name: 最关键——让真 git 读取 tinygit 生成的 delta pack
+        run: |
+          cd ${{ runner.temp }}/gc-demo
+          echo "--- 真 git fsck（校验 pack 完整性、delta 链、idx 一致性）---"
+          git fsck --strict
+          echo "--- 真 git log ---"
+          git log --oneline | head -5
+          test "$(git rev-list --count HEAD)" -eq 20
+          echo "--- 真 git 读取打包后的文件内容 ---"
+          git cat-file -p HEAD:data.txt | head -3
+          test "$(git cat-file -p HEAD:data.txt | wc -l)" -eq 81
+          git rev-list --objects --all | wc -l
+          echo "真 git 成功读取了 tinygit 生成的全部对象（含 delta）"
+
+      - name: 验证 delta 确实被使用
+        run: |
+          cd ${{ runner.temp }}/gc-demo
+          ls -l .git/objects/pack/*.pack
+          PACK_SIZE=$(stat -c%s .git/objects/pack/*.pack)
+          echo "pack 大小: $PACK_SIZE 字节"
+          # 20 个版本、每个约 2.5 KB，整存至少 50 KB；实际应明显更小
+          if [ "$PACK_SIZE" -gt 20000 ]; then
+            echo "错误: pack 过大（$PACK_SIZE 字节），delta 似乎没有生效"
+            exit 1
+          fi
+          echo "pack 大小合理，delta 压缩已生效"
+
   demo:
     runs-on: ubuntu-latest
     steps:

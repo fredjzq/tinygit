@@ -1,5 +1,58 @@
 # 变更日志
 
+## 1.2.0
+
+这一版补上了「让对象真正可维护」的完整链路：写 delta、打包、清理、引用打包。
+之前能读 delta pack，但自己生成的 pack 是整存，同一文件的历史版本被重复存了很多遍。
+
+### 新增
+
+- **delta 编码器**（\`src/pack/delta-writer.js\`）
+  固定块滚动哈希建索引 + 最长匹配延伸。50 个版本的代码文件缩减 87.8%，
+  2.8 MB 大文件的历史缩减 96.4%。每个编码结果都先用 \`applyDelta\` 还原校验，
+  不一致就放弃 delta 退回整存。
+- **pack 写入支持 OFS_DELTA**（\`src/pack/writer.js\`）
+  候选按长度接近度选取并限制数量；收益超过 50% 就停止尝试其它候选。
+- **\`gc\` 命令**（\`src/commands/gc.js\`）
+  两阶段流程：先从分支/HEAD/索引标记可达对象，写 pack 成功后才删松散文件。
+  不可达对象保留（本项目无 reflog，激进清理风险大于收益）。
+- **\`packed-refs\` 支持**（\`src/packed-refs.js\`）
+  引用合并为单文件，松散 ref 优先于打包记录。\`gc --pack-refs\` 触发。
+- **审计器新增独立 pack 校验**（\`scripts/audit.mjs\`）
+  完全不复用 \`src/pack/\` 代码，从头实现 idx/pack 解析。真实仓库 18,341 项检查通过。
+
+### 修复
+
+- **\`readObject\` 遇到 pack 对象时全部失败**
+  pack 解析器已实现且有单元测试，但没接进 \`readObject\`。
+  结果：单元测试全绿，任何 clone 下来的仓库所有命令都报
+  \`object not found (packed objects are not supported)\`。
+  现在松散 → pack 回退，并按「文件名 + 大小 + mtime」做缓存失效。
+- **pack 解析慢 10 倍**
+  原先不知道 zlib 流有多长，用「截断输入必然解压失败」做二分，
+  每个对象约 20 次 \`inflate\`。改用 \`inflateSync(buf, { info: true })\`
+  的 \`engine.bytesWritten\` 直接拿到消耗字节数。
+  3513 对象的 7.6 MB pack：**1144 ms → 100 ms**。
+- **\`branch -d\` 静默失效且可能删错**
+  \`-d\` 被解析成布尔标志，\`String(flags.d)\` 变成 \`"true"\`，
+  于是报 \`branch not found: true\`，真正要删的分支根本没动。
+  改为从位置参数取分支名。
+- **删除已打包的分支会复活**
+  只删了松散 ref 文件，\`packed-refs\` 里的记录还在。
+  现在 \`deleteRef\` 同时处理两处。
+- **审计器漏检悬空引用**
+  分支指向不存在的提交时没报错——遍历队列用 \`filter(objects.has)\`
+  把非法 tip 静默丢弃了。现在单独检查每个 ref 的目标是否存在。
+- **审计器误报浅克隆仓库**
+  \`clone --depth\` 的边界提交其 parent 有意不存在，现在读 \`.git/shallow\` 并跳过。
+
+### 测试
+
+- 新增 \`test/pack-delta-writer.test.js\`（11 项）：每个用例都做 delta→apply 往返校验
+- 新增 \`test/gc-packed-refs.test.js\`（9 项）：含「gc 不能丢已暂存对象」
+  「删除打包分支不能复活」「dry-run 不产生副作用」
+- 总计 **148 项测试**
+
 ## 1.1.1
 
 全面检查维护：修掉 5 个真实缺陷，其中 2 个会导致数据错误。

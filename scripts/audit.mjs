@@ -47,6 +47,204 @@ function oidOf(type, body) {
   return createHash("sha1").update(header).update(body).digest("hex");
 }
 
+// ---------- 独立实现：packfile 与 idx ----------
+//
+// 这一段完全不复用 src/pack/ 的任何代码，从头实现 Git 的 pack 格式规则。
+// 如果审计器调用被测代码，同一处 bug 会让两边一起错、一起「通过」，
+// 验证就失去意义。
+//
+// 校验内容：
+//   - idx 的 fanout 表单调递增，末项等于对象数
+//   - idx 的 sha 表严格升序（否则二分查找会失效）
+//   - idx 尾部两个校验和都正确（这是最容易写错的地方）
+//   - 每个对象的偏移指向合法的对象头
+//   - delta 链能完整还原，且还原后的 sha 与 idx 记录一致
+
+// 读普通 size varint（对象头里的 size 字段）
+function readSizeVarint(buf, start) {
+  let value = 0;
+  let shift = 0;
+  let pos = start;
+  for (;;) {
+    const b = buf[pos];
+    value |= (b & 0x7f) << shift;
+    pos += 1;
+    if ((b & 0x80) === 0) break;
+    shift += 7;
+    if (shift > 63) throw new Error("varint too long");
+  }
+  return { value, next: pos };
+}
+
+// idx v2 解析
+function parseIdxIndependent(buf) {
+  if (buf.readUInt32BE(0) !== 0xff744f63) throw new Error("bad idx magic");
+  const version = buf.readUInt32BE(4);
+  if (version !== 2) throw new Error("unsupported idx version " + version);
+
+  const fanout = new Uint32Array(256);
+  for (let i = 0; i < 256; i += 1) fanout[i] = buf.readUInt32BE(8 + i * 4);
+  const count = fanout[255];
+
+  for (let i = 1; i < 256; i += 1) {
+    if (fanout[i] < fanout[i - 1]) throw new Error("fanout not monotonic at " + i);
+  }
+
+  const shaStart = 8 + 256 * 4;
+  const shas = [];
+  for (let i = 0; i < count; i += 1) {
+    shas.push(buf.subarray(shaStart + i * 20, shaStart + i * 20 + 20).toString("hex"));
+  }
+  for (let i = 1; i < count; i += 1) {
+    if (!(shas[i - 1] < shas[i])) throw new Error("sha table not sorted at " + i);
+  }
+  for (let i = 0; i < count; i += 1) {
+    const first = parseInt(shas[i].slice(0, 2), 16);
+    if (fanout[first] < i + 1) throw new Error("fanout does not cover sha " + i);
+  }
+
+  const crcStart = shaStart + count * 20;
+  const offStart = crcStart + count * 4;
+  const largeStart = offStart + count * 4;
+
+  const offsets = [];
+  for (let i = 0; i < count; i += 1) {
+    const raw = buf.readUInt32BE(offStart + i * 4);
+    if (raw & 0x80000000) {
+      const li = raw & 0x7fffffff;
+      const p = largeStart + li * 8;
+      if (p + 8 > buf.length - 40) throw new Error("large offset out of range");
+      const big = buf.readBigUInt64BE(p);
+      if (big > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error("offset too large");
+      offsets.push(Number(big));
+    } else {
+      offsets.push(raw);
+    }
+  }
+
+  const packChecksum = buf.subarray(buf.length - 40, buf.length - 20).toString("hex");
+  const idxChecksum = buf.subarray(buf.length - 20).toString("hex");
+  const computedIdx = createHash("sha1").update(buf.subarray(0, buf.length - 20)).digest("hex");
+
+  return { version, count, shas, offsets, fanout, packChecksum, idxChecksum, computedIdx };
+}
+
+// 从 pack 里解析出所有对象（含 delta 还原）
+function parsePackIndependent(buf) {
+  if (buf.subarray(0, 4).toString("latin1") !== "PACK") throw new Error("bad pack magic");
+  const version = buf.readUInt32BE(4);
+  if (version !== 2 && version !== 3) throw new Error("unsupported pack version " + version);
+  const count = buf.readUInt32BE(8);
+
+  const byOffset = new Map();
+  let offset = 12;
+  const TYPES = { 1: "commit", 2: "tree", 3: "blob", 4: "tag" };
+
+  for (let i = 0; i < count; i += 1) {
+    const start = offset;
+    let byte = buf[offset]; offset += 1;
+    const typeNum = (byte >> 4) & 0x07;
+    let size = byte & 0x0f;
+    let shift = 4;
+    while (byte & 0x80) {
+      byte = buf[offset]; offset += 1;
+      size |= (byte & 0x7f) << shift;
+      shift += 7;
+    }
+
+    let baseOffset = null;
+    let baseOid = null;
+    if (typeNum === 6) {
+      let b = buf[offset]; offset += 1;
+      let dist = b & 0x7f;
+      while (b & 0x80) {
+        b = buf[offset]; offset += 1;
+        dist = ((dist + 1) << 7) | (b & 0x7f);
+      }
+      baseOffset = start - dist;
+    } else if (typeNum === 7) {
+      baseOid = buf.subarray(offset, offset + 20).toString("hex");
+      offset += 20;
+    }
+
+    const remaining = buf.length - 20 - offset;
+    const res = inflateSync(buf.subarray(offset, offset + remaining), { info: true });
+    const consumed = res.engine.bytesWritten;
+    const data = res.buffer;
+    offset += consumed;
+
+    byOffset.set(start, { offset: start, typeNum, size, baseOffset, baseOid, data });
+  }
+
+  const resolved = new Map();
+  const oidByOffset = new Map();
+
+  function applyDelta(base, delta) {
+    const bsz = readSizeVarint(delta, 0);
+    if (base.length !== bsz.value) throw new Error("delta base size mismatch");
+    const rsz = readSizeVarint(delta, bsz.next);
+    let pos = rsz.next;
+    const out = Buffer.allocUnsafe(rsz.value);
+    let outPos = 0;
+    while (pos < delta.length) {
+      const cmd = delta[pos]; pos += 1;
+      if (cmd === 0) throw new Error("zero delta command");
+      if (cmd & 0x80) {
+        let off = 0, len = 0;
+        if (cmd & 0x01) { off |= delta[pos]; pos += 1; }
+        if (cmd & 0x02) { off |= delta[pos] << 8; pos += 1; }
+        if (cmd & 0x04) { off |= delta[pos] << 16; pos += 1; }
+        if (cmd & 0x08) { off |= delta[pos] << 24; pos += 1; }
+        if (cmd & 0x10) { len |= delta[pos]; pos += 1; }
+        if (cmd & 0x20) { len |= delta[pos] << 8; pos += 1; }
+        if (cmd & 0x40) { len |= delta[pos] << 16; pos += 1; }
+        if (len === 0) len = 0x10000;
+        if (off + len > base.length) throw new Error("delta copy out of range");
+        base.copy(out, outPos, off, off + len);
+        outPos += len;
+      } else {
+        const len = cmd;
+        if (pos + len > delta.length) throw new Error("delta insert out of range");
+        delta.copy(out, outPos, pos, pos + len);
+        pos += len;
+        outPos += len;
+      }
+    }
+    if (outPos !== rsz.value) throw new Error("delta result size mismatch");
+    return out;
+  }
+
+  function resolve(off, depth = 0) {
+    if (depth > 64) throw new Error("delta chain too deep");
+    if (resolved.has(off)) return resolved.get(off);
+    const e = byOffset.get(off);
+    if (!e) throw new Error("no object at offset " + off);
+
+    let result;
+    if (e.typeNum === 6) {
+      const base = resolve(e.baseOffset, depth + 1);
+      result = { type: base.type, content: applyDelta(base.content, e.data) };
+    } else if (e.typeNum === 7) {
+      let base = null;
+      for (const [o, obj] of resolved) {
+        if (oidByOffset.get(o) === e.baseOid) { base = obj; break; }
+      }
+      if (!base) throw new Error("REF_DELTA base " + e.baseOid + " not in pack");
+      result = { type: base.type, content: applyDelta(base.content, e.data) };
+    } else {
+      const t = TYPES[e.typeNum];
+      if (!t) throw new Error("unknown object type " + e.typeNum);
+      result = { type: t, content: e.data };
+    }
+    resolved.set(off, result);
+    oidByOffset.set(off, oidOf(result.type, result.content));
+    return result;
+  }
+
+  for (const off of byOffset.keys()) resolve(off);
+  return { count, byOffset, resolved, oidByOffset };
+}
+
 // ---------- 独立实现：tree 解析 ----------
 function parseTreeBody(body) {
   const entries = [];
@@ -147,7 +345,114 @@ async function main() {
   let packFiles = [];
   try { packFiles = (await readdir(packDir)).filter((f) => f.endsWith(".pack")); } catch {}
   if (packFiles.length > 0) {
-    console.log("  · 存在 " + packFiles.length + " 个 pack 文件（本审计器只验松散对象）");
+    console.log("  · 存在 " + packFiles.length + " 个 pack 文件，开始独立校验");
+  }
+
+  // ===== 2b. pack 与 idx 独立校验 =====
+  //
+  // 这一段的每个断言都独立于被测实现。pack 解析涉及 zlib 边界、
+  // delta 链、两种变长整数——任何一处错位都会让 sha 算不出来，
+  // 所以「sha 与 idx 吻合」是极强的正确性证据。
+  let packObjectCount = 0;
+  for (const packName of packFiles) {
+    const base = packName.replace(/\.pack$/, "");
+    const packPath = path.join(packDir, packName);
+    const idxPath = path.join(packDir, base + ".idx");
+
+    const packBuf = await readFile(packPath);
+    check("pack " + base.slice(0, 20) + " 结尾校验和正确",
+      createHash("sha1").update(packBuf.subarray(0, packBuf.length - 20)).digest("hex")
+        === packBuf.subarray(packBuf.length - 20).toString("hex"));
+
+    let idxBuf;
+    try {
+      idxBuf = await readFile(idxPath);
+    } catch {
+      check("idx " + base.slice(0, 20) + " 存在", false, "缺少对应 .idx");
+      continue;
+    }
+
+    let idx;
+    try {
+      idx = parseIdxIndependent(idxBuf);
+      check("idx " + base.slice(0, 20) + " 格式合法", true);
+    } catch (err) {
+      check("idx " + base.slice(0, 20) + " 格式合法", false, err.message);
+      continue;
+    }
+
+    // idx 尾部自校验和：覆盖 [0, len-20)，**包含** pack 校验和
+    check("idx 自校验和正确", idx.computedIdx === idx.idxChecksum,
+      "计算 " + idx.computedIdx.slice(0, 8) + " vs 记录 " + idx.idxChecksum.slice(0, 8));
+    // idx 记录的 pack 校验和必须等于 pack 文件的实际校验和
+    check("idx 记录的 pack 校验和与实际一致",
+      idx.packChecksum === packBuf.subarray(packBuf.length - 20).toString("hex"));
+
+    // pack 头声明的对象数必须等于 idx 的对象数
+    const declared = packBuf.readUInt32BE(8);
+    check("pack 头对象数与 idx 一致", declared === idx.count,
+      "pack " + declared + " vs idx " + idx.count);
+
+    // 解析 pack 并还原所有 delta 链
+    let parsed;
+    try {
+      parsed = parsePackIndependent(packBuf);
+      check("pack 对象全部可解析（含 delta 链还原）", true);
+    } catch (err) {
+      check("pack 对象全部可解析（含 delta 链还原）", false, err.message);
+      continue;
+    }
+
+    // 每个 idx 记录的 sha 都必须在 pack 里找到对应的对象
+    const packOids = new Set(parsed.oidByOffset.values());
+    let matched = 0;
+    let missing = null;
+    for (const sha of idx.shas) {
+      if (packOids.has(sha)) matched += 1;
+      else if (!missing) missing = sha;
+    }
+    check("idx 的 sha 与 pack 内容一一对应", matched === idx.count,
+      missing ? "缺 " + missing.slice(0, 8) + "（" + matched + "/" + idx.count + "）" : "");
+
+    // idx 记录的偏移必须指向 pack 中真实存在的对象
+    let offsetOk = 0;
+    for (const off of idx.offsets) {
+      if (parsed.byOffset.has(off)) offsetOk += 1;
+    }
+    check("idx 的偏移都指向真实对象", offsetOk === idx.count,
+      offsetOk + "/" + idx.count);
+
+    // 统计 delta 对象数量（信息性，不作为失败条件）
+    let deltaCount = 0;
+    for (const [, e] of parsed.byOffset) if (e.typeNum === 6 || e.typeNum === 7) deltaCount += 1;
+    console.log("  · " + base.slice(0, 20) + ": " + parsed.count + " 个对象，其中 delta " + deltaCount + " 个");
+    packObjectCount += parsed.count;
+
+    // pack 里的对象也加入总对象集合，供后面的可达性检查使用。
+    // 注意字段名统一：审计器全局约定对象是 {type, body}，
+    // 而 pack 解析器内部用 {type, content}。这里做一次转换。
+    for (const [off, oid] of parsed.oidByOffset) {
+      const obj = parsed.resolved.get(off);
+      objects.set(oid, { type: obj.type, body: obj.content });
+    }
+  }
+
+  // ===== 2c. 浅克隆边界 =====
+  //
+  // 浅克隆（clone --depth N）会刻意截断历史：边界提交的 parent
+  // 在本地根本不存在，这是设计如此，不是损坏。
+  // 不识别这一点，任何浅克隆仓库都会被误报为「parent 缺失」。
+  const shallowSet = new Set();
+  try {
+    const shallowText = (await readFile(path.join(gitDir, "shallow"), "utf8")).trim();
+    for (const line of shallowText.split(/\r?\n/)) {
+      if (/^[0-9a-f]{40}$/.test(line.trim())) shallowSet.add(line.trim());
+    }
+    if (shallowSet.size > 0) {
+      console.log("  · 浅克隆仓库，边界提交 " + shallowSet.size + " 个（历史被人为截断）");
+    }
+  } catch {
+    // 没有 shallow 文件 = 完整仓库
   }
 
   // ===== 3. 引用 =====
@@ -163,8 +468,41 @@ async function main() {
   }
   await walkRefs(path.join(gitDir, "refs", "heads"), "");
 
+  // packed-refs 里的分支也必须算进来。
+  // 曾经这里只遍历松散目录：一旦跑过 gc --pack-refs（松散文件被清空），
+  // 审计器就会认为仓库「没有任何分支」，进而把全部对象误判为孤儿。
+  const packedBranchCount = { n: 0 };
+  try {
+    const packedText = await readFile(path.join(gitDir, "packed-refs"), "utf8");
+    const existing = new Set(branches.map((b) => b.ref));
+    for (const raw of packedText.split(/\r?\n/)) {
+      const line = raw.trim();
+      if (!line || line.startsWith("#") || line.startsWith("^")) continue;
+      const sp = line.indexOf(" ");
+      if (sp < 0) continue;
+      const oid = line.slice(0, sp);
+      const ref = line.slice(sp + 1);
+      if (!/^[0-9a-f]{40}$/.test(oid) || !ref.startsWith("refs/heads/")) continue;
+      // 松散 ref 优先：同名时以松散为准
+      if (existing.has(ref)) continue;
+      existing.add(ref);
+      branches.push({ ref, oid });
+      packedBranchCount.n += 1;
+    }
+    if (packedBranchCount.n > 0) {
+      console.log("  · packed-refs 中读到 " + packedBranchCount.n + " 个分支");
+    }
+  } catch {
+    // 没有 packed-refs 是正常情况
+  }
+
   for (const b of branches) {
     check("ref " + b.ref + " holds 40-hex", /^[0-9a-f]{40}$/.test(b.oid), b.oid);
+    // 悬空引用：分支指向一个不存在的对象。
+    // 这是真实的数据损坏——git log 会在这里报错。
+    // 曾经这里漏检：下面的遍历用 filter(objects.has) 把不存在的 tip
+    // 静默过滤掉了，于是「分支指向空」这条不会触发任何失败。
+    check("ref " + b.ref + " target exists", objects.has(b.oid), b.oid);
   }
 
   // HEAD 指向的分支是否存在（unborn 情形允许不存在）
@@ -181,7 +519,9 @@ async function main() {
   // ===== 4. 沿提交图遍历，验证可达性与结构 =====
   const reachable = new Set();
   const commitData = new Map();
-  const queue = branches.map((b) => b.oid).filter((o) => objects.has(o));
+  // 这里不 filter：指向不存在对象的 tip 已在上面单独报错，
+  // 若在此静默丢弃，遍历就永远不会发现它。
+  const queue = branches.map((b) => b.oid).filter((o) => /^[0-9a-f]{40}$/.test(o));
   while (queue.length) {
     const oid = queue.shift();
     if (reachable.has(oid)) continue;
@@ -204,10 +544,17 @@ async function main() {
     // merge commit 必须有两个以上 parent
     if (c.parents.length > 0) {
       for (const p of c.parents) {
+        // 浅克隆边界：该提交的 parent 有意不存在，跳过
+        if (shallowSet.has(oid)) continue;
         check("commit " + oid.slice(0, 7) + " parent exists", objects.has(p), p);
       }
     }
-    for (const p of c.parents) queue.push(p);
+    // 浅克隆边界提交的 parent 不存在，不要入队——
+    // 否则遍历到它时会报 "reachable object ... present" 失败。
+    for (const p of c.parents) {
+      if (shallowSet.has(oid)) continue;
+      queue.push(p);
+    }
   }
 
   // ===== 5. tree 深度校验：mode 合法、条目有序、子树类型正确 =====
