@@ -1,0 +1,14 @@
+# 测试与验收过程中产生的临时仓库
+.e2e*/
+.clitest/
+.clonetest*/
+.audittest/
+.verifytest/
+.cptest/
+.rb*/
+.switch*/
+node_modules/
+*.log
+
+# 本地脚本产物
+resume-point.json
