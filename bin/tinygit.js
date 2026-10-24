@@ -63,7 +63,7 @@ async function main(argv) {
 
   // --version / -v 优先于 help：用户想查版本时不该被帮助文本淹没
   if (command === "version" || flags.version === true) {
-    console.log("tinygit 1.4.0");
+    console.log("tinygit 1.4.1");
     return 0;
   }
 

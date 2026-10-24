@@ -1,6 +1,6 @@
 {
   "name": "tinygit",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "A Git subset implemented in pure JavaScript: content-addressed objects, index, commits, diffs",
   "type": "module",
   "bin": {
