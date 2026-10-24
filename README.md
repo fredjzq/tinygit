@@ -1,5 +1,7 @@
 # tinygit
 
+> v1.4.0 · 22 个命令 · 188 项测试 · 零依赖
+
 **用纯 JavaScript 从零实现的 Git 子集。** 零依赖，不调用 `git` 命令，直接按 Git 的磁盘格式读写仓库。
 
 它创建出来的仓库，**一个真正的 Git 客户端可以直接打开** —— 对象哈希、tree 排序、索引校验和、commit 格式全部按规范实现，并由一个独立重写的验证器交叉校验。
@@ -49,14 +51,18 @@ node scripts/demo.mjs
 | `branch [-d <名>] [<名>]` | 列出 / 创建 / 删除分支 |
 | `rm <路径...>` | 从索引移除（保留工作区文件）|
 | `merge <分支>` | 快进或三方归并，冲突时写标记文件 |
+| `cherry-pick <提交>` | 把某个提交的改动重放到当前分支 |
+| `rebase <分支>` | 把当前分支的提交搬到另一基点 |
+| `rebase --continue` | 解决冲突后继续 rebase |
+| `rebase --abort` | 放弃 rebase 并回到原位置 |
 | `clone <url> [目录]` | 从远程仓库克隆（智能 HTTP 协议） |
 | `fetch <url>` | 抓取远程更新，带 have/want 协商 |
 | `gc [--dry-run]` | 打包松散对象（含 delta 压缩）并清理 |
 | `gc --pack-refs` | 把分支引用写入 `packed-refs` |
 | `pack-info` | 统计 `.git/objects/pack` 里的打包对象 |
 | `checkout <分支>` | 切换分支并检出文件 |
-| `ls-tree <tree>` | 列出树内容（输出格式与 git 一致） |
-| `cat-file <对象>` | 输出对象原始内容 |
+| `ls-tree <引用>` | 列出树内容，接受 HEAD / 分支名 / HEAD~n |
+| `cat-file <引用>` | 输出对象原始内容，接受 HEAD / 分支名 / 短 sha |
 | `hash-object <文件>` | 计算并写入 blob |
 
 ## 实现要点
@@ -252,7 +258,7 @@ THEIRS
 node --test
 ```
 
-**128 项测试**，覆盖对象哈希常量、tree 排序、索引字节布局、diff 最短性、
+**188 项测试**，覆盖对象哈希常量、tree 排序、索引字节布局、diff 最短性、
 pack 变长整数、delta 应用、pack 写入读取闭环、真实 pack 解析、三方归并、merge base。
 
 ### 独立审计器（`scripts/audit.mjs`）
@@ -330,7 +336,7 @@ src/
 scripts/
   demo.mjs            端到端演示
   verify.mjs          独立格式验证器
-test/                 128 项测试
+test/                 188 项测试
 ```
 
 ## License

@@ -174,15 +174,23 @@ async function runTodo(gitDir, rootDir, { author, now, abortIfConflict }) {
     await writeFile(paths.done, String(i + 1) + "\n");
   }
 
-  return finishRebase(gitDir, { results, empty });
+  return finishRebase(gitDir, rootDir, { results, empty });
 }
 
 // 全部完成后：把分支引用移到新位置，恢复 HEAD 为符号引用
-async function finishRebase(gitDir, { results, empty }) {
+async function finishRebase(gitDir, rootDir, { results, empty }) {
   const paths = rebasePaths(gitDir);
   const headName = (await readFile(paths.headName, "utf8")).trim();
   const origHead = (await readFile(paths.origHead, "utf8")).trim();
   const newHead = (await readFile(gitDir + "/HEAD", "utf8")).trim();
+
+  // 把新基点的完整 tree 检出到工作区。
+  //
+  // cherry-pick 只处理「被重放提交涉及的路径」，新基点上新增/删除的文件
+  // 完全没被碰过。不在这里整体重建工作区，就会出现「索引和 HEAD 都有
+  // main2.txt，但磁盘上没有」——status 报删除，用户一脸困惑。
+  const { restoreTree } = await import("./branch.js");
+  await restoreTree(gitDir, rootDir, newHead);
 
   await writeRef(gitDir, headName, newHead);
   await setHeadSymref(gitDir, headName);

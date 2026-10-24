@@ -60,6 +60,17 @@ async function main() {
   const repo = path.resolve(process.argv[2] ?? ".");
   const gitDir = path.join(repo, ".git");
 
+  // 先把「这不是一个仓库」这种最常见的用户错误报清楚。
+  // 直接读 HEAD 会让 ENOENT 堆栈糊满屏幕，看不出该做什么。
+  try {
+    await readFile(path.join(gitDir, "HEAD"));
+  } catch {
+    console.error("这不是一个 tinygit 仓库: " + repo);
+    console.error("用法: node scripts/verify.mjs <仓库路径>");
+    console.error("（先在一个空目录里执行 tinygit init，再提交一些内容）");
+    process.exit(1);
+  }
+
   // 1) HEAD 是合法的符号引用
   const head = (await readFile(path.join(gitDir, "HEAD"), "utf8")).trim();
   check("HEAD is a symref", /^ref: refs\/heads\/[^\s]+$/.test(head), head);

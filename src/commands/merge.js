@@ -40,7 +40,13 @@ export async function merge(gitDir, rootDir, branchName, {
   }
 
   // 情况 2：快进（当前 HEAD 是目标分支的祖先）
+  //
+  // 快进不只是「移动指针」。真 git 还会把目标 tree 检出到工作区并更新索引。
+  // 只移指针的后果：目标分支新增的文件不在磁盘上，索引也停留在旧状态，
+  // 于是 status 把它们报成「已删除」——工作区和 HEAD 看起来完全不一致。
   if (await canFastForward(gitDir, head.oid, targetOid)) {
+    const { restoreTree } = await import("./branch.js");
+    await restoreTree(gitDir, rootDir, targetOid);
     await updateHead(gitDir, targetOid);
     return { result: "fast-forward", branch: branchName, oid: targetOid };
   }
